@@ -1,0 +1,120 @@
+Option Explicit
+
+Private Const TARGET_SHEET As String = "Cover page"
+Private Const FIRST_SCAN_ROW As Long = 18
+Private Const LAST_SCAN_ROW As Long = 22
+Private Const FIRST_SCAN_COL As String = "C"
+Private Const LAST_SCAN_COL As String = "F"
+
+Public Sub CoverPage_UpdateLatestPastDate_ToNextMonth()
+
+    Dim ws As Worksheet
+    Dim rng As Range, cel As Range
+    Dim bestCell As Range
+    Dim bestDate As Date
+    Dim testDate As Date
+    Dim found As Boolean
+    
+    Dim oldCalc As XlCalculation
+    Dim oldScreen As Boolean
+    Dim oldEvents As Boolean
+    
+    Set ws = ThisWorkbook.Worksheets(TARGET_SHEET)
+    Set rng = ws.Range(FIRST_SCAN_COL & FIRST_SCAN_ROW & ":" & LAST_SCAN_COL & LAST_SCAN_ROW)
+    
+    oldCalc = Application.Calculation
+    oldScreen = Application.ScreenUpdating
+    oldEvents = Application.EnableEvents
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    
+    On Error GoTo SafeExit
+    
+    found = False
+    
+    For Each cel In rng.Cells
+        If TryGetDateFromCell(cel, testDate) Then
+            If testDate <= Date Then
+                If Not found Then
+                    Set bestCell = GetWriteCell(cel)
+                    bestDate = testDate
+                    found = True
+                ElseIf testDate > bestDate Then
+                    Set bestCell = GetWriteCell(cel)
+                    bestDate = testDate
+                End If
+            End If
+        End If
+    Next cel
+    
+    If found Then
+        bestCell.Value = NextMonthSameDayOrEOM(bestDate)
+        bestCell.NumberFormat = "dd mmm yyyy"
+        MsgBox "Updated " & bestCell.Address(False, False) & _
+               " to " & Format$(bestCell.Value, "dd mmm yyyy"), vbInformation
+    Else
+        MsgBox "No valid date found in range " & rng.Address(False, False), vbExclamation
+    End If
+
+SafeExit:
+    Application.ScreenUpdating = oldScreen
+    Application.EnableEvents = oldEvents
+    Application.Calculation = oldCalc
+
+End Sub
+
+Private Function TryGetDateFromCell(ByVal cel As Range, ByRef outDate As Date) As Boolean
+    
+    Dim v As Variant
+    Dim s As String
+    Dim targetCell As Range
+    
+    On Error GoTo Fail
+    
+    Set targetCell = GetWriteCell(cel)
+    v = targetCell.Value
+    
+    If IsError(v) Or IsEmpty(v) Then Exit Function
+    
+    If IsDate(v) Then
+        outDate = CDate(v)
+        TryGetDateFromCell = True
+        Exit Function
+    End If
+    
+    s = Trim$(CStr(v))
+    If Len(s) = 0 Then Exit Function
+    
+    s = Replace$(s, ".", " ")
+    s = Replace$(s, ",", " ")
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    
+    If IsDate(s) Then
+        outDate = CDate(s)
+        TryGetDateFromCell = True
+        Exit Function
+    End If
+    
+Fail:
+
+End Function
+
+Private Function GetWriteCell(ByVal cel As Range) As Range
+    If cel.MergeCells Then
+        Set GetWriteCell = cel.MergeArea.Cells(1, 1)
+    Else
+        Set GetWriteCell = cel
+    End If
+End Function
+
+Private Function NextMonthSameDayOrEOM(ByVal d As Date) As Date
+    If Day(d) < 28 Then
+        NextMonthSameDayOrEOM = DateSerial(Year(d), Month(d) + 1, Day(d))
+    Else
+        NextMonthSameDayOrEOM = WorksheetFunction.EoMonth(d, 1)
+    End If
+End Function

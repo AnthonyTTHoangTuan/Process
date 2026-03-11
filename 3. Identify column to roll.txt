@@ -1,0 +1,312 @@
+Option Explicit
+
+'========================
+' USER SETTINGS
+'========================
+Private Const SHEETLIST_NAME As String = "SheetList"
+Private Const SHEETNAME_COL As String = "A"
+Private Const OUTPUT_COL As String = "B"
+
+'Limit scanning range here for speed
+Private Const SCAN_FIRST_ROW As Long = 1
+Private Const SCAN_LAST_ROW As Long = 12
+
+Private Const SCAN_FIRST_COL As String = "A"
+Private Const SCAN_LAST_COL As String = "AZ"
+'========================
+
+
+Public Sub FillLatestCol_SheetList_Fast_LimitedRange()
+
+    Dim wb As Workbook
+    Dim wsList As Worksheet
+    Dim ws As Worksheet
+    Dim lastListRow As Long
+    Dim i As Long
+    Dim shName As String
+    Dim latestCol As Long
+    
+    Dim oldCalc As XlCalculation
+    Dim oldScreen As Boolean
+    Dim oldEvents As Boolean
+    
+    Set wb = ThisWorkbook
+    Set wsList = wb.Worksheets(SHEETLIST_NAME)
+    
+    lastListRow = wsList.Cells(wsList.Rows.Count, SHEETNAME_COL).End(xlUp).Row
+    
+    oldCalc = Application.Calculation
+    oldScreen = Application.ScreenUpdating
+    oldEvents = Application.EnableEvents
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    
+    On Error GoTo SafeExit
+    
+    For i = 2 To lastListRow
+        
+        shName = Trim$(CStr(wsList.Cells(i, SHEETNAME_COL).Value2))
+        wsList.Cells(i, OUTPUT_COL).ClearContents
+        
+        If Len(shName) > 0 Then
+            If IsBSPLSheetName(shName) Then
+                
+                Set ws = Nothing
+                On Error Resume Next
+                Set ws = wb.Worksheets(shName)
+                On Error GoTo SafeExit
+                
+                If Not ws Is Nothing Then
+                    latestCol = GetLatestMonthlyRollColumn_Limited(ws)
+                    If latestCol > 0 Then
+                        wsList.Cells(i, OUTPUT_COL).Value = ColumnLetter(ws, latestCol)
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+SafeExit:
+    Application.ScreenUpdating = oldScreen
+    Application.EnableEvents = oldEvents
+    Application.Calculation = oldCalc
+    
+    If Err.Number = 0 Then
+        MsgBox "Done", vbInformation
+    Else
+        MsgBox "Error: " & Err.Description, vbExclamation
+    End If
+
+End Sub
+
+
+Private Function GetLatestMonthlyRollColumn_Limited(ByVal ws As Worksheet) As Long
+    
+    Dim firstCol As Long, lastCol As Long
+    Dim firstRow As Long, lastRow As Long
+    Dim arr As Variant
+    
+    Dim r As Long, c As Long
+    Dim bestRowScore As Long
+    Dim rowScore As Long
+    Dim bestCol As Long
+    Dim rowLatestCol As Long
+    
+    firstRow = SCAN_FIRST_ROW
+    lastRow = SCAN_LAST_ROW
+    firstCol = ws.Range(SCAN_FIRST_COL & "1").Column
+    lastCol = ws.Range(SCAN_LAST_COL & "1").Column
+    
+    If firstRow < 2 Then firstRow = 2
+    If lastRow < firstRow Then Exit Function
+    If lastCol < firstCol + 1 Then Exit Function
+    
+    arr = ws.Range(ws.Cells(firstRow, firstCol), ws.Cells(lastRow, lastCol)).Value2
+    
+    bestRowScore = 0
+    bestCol = 0
+    
+    ' arr row 1 = actual worksheet row firstRow
+    ' monthly header row must have a title row above it => actual row >= 2 already ensured
+    For r = 2 To UBound(arr, 1)
+        
+        rowScore = 0
+        rowLatestCol = 0
+        
+        For c = UBound(arr, 2) To 2 Step -1
+            
+            If IsMonthlyPeriodFast(arr(r, c)) Then
+                If IsMonthlyPeriodFast(arr(r, c - 1)) Then
+                    
+                    If SameTopTitleFast(ws, firstRow + r - 2, firstCol + c - 1, firstCol + c - 2) Then
+                        rowScore = rowScore + 1
+                        If rowLatestCol = 0 Then
+                            rowLatestCol = firstCol + c - 1
+                        End If
+                    End If
+                    
+                End If
+            End If
+            
+        Next c
+        
+        If rowScore > bestRowScore Then
+            bestRowScore = rowScore
+            bestCol = rowLatestCol
+        ElseIf rowScore = bestRowScore And rowLatestCol > bestCol Then
+            bestCol = rowLatestCol
+        End If
+        
+    Next r
+    
+    GetLatestMonthlyRollColumn_Limited = bestCol
+
+End Function
+
+
+Private Function SameTopTitleFast(ByVal ws As Worksheet, ByVal titleRow As Long, ByVal col1 As Long, ByVal col2 As Long) As Boolean
+    
+    Dim t1 As String, t2 As String
+    
+    t1 = NormalizeTitle(GetDisplayedTitle(ws.Cells(titleRow, col1)))
+    t2 = NormalizeTitle(GetDisplayedTitle(ws.Cells(titleRow, col2)))
+    
+    SameTopTitleFast = (Len(t1) > 0 And t1 = t2)
+
+End Function
+
+
+Private Function GetDisplayedTitle(ByVal cel As Range) As String
+    On Error Resume Next
+    If cel.MergeCells Then
+        GetDisplayedTitle = CStr(cel.MergeArea.Cells(1, 1).Value2)
+    Else
+        GetDisplayedTitle = CStr(cel.Value2)
+    End If
+    On Error GoTo 0
+End Function
+
+
+Private Function NormalizeTitle(ByVal s As String) As String
+    
+    s = UCase$(Trim$(s))
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, Chr$(160), " ")
+    
+    Do While InStr(1, s, "  ", vbBinaryCompare) > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    
+    NormalizeTitle = s
+
+End Function
+
+
+Private Function IsMonthlyPeriodFast(ByVal v As Variant) As Boolean
+    
+    Dim s As String
+    Dim n As Double
+    
+    If IsError(v) Or IsEmpty(v) Then Exit Function
+    
+    If IsNumeric(v) Then
+        n = CDbl(v)
+        'Excel date serial range safeguard
+        If n >= 30000 And n <= 70000 Then
+            IsMonthlyPeriodFast = True
+            Exit Function
+        End If
+    End If
+    
+    s = UCase$(Trim$(CStr(v)))
+    If Len(s) = 0 Then Exit Function
+    
+    'Exclude non-month period headings
+    If InStr(1, s, "FY", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, s, "QUARTER", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, s, "YTD", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, s, "QTD", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, s, "MTD", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, s, "HALF YEAR", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, s, "HALFYEAR", vbTextCompare) > 0 Then Exit Function
+    
+    If HasQuarterToken(s) Then Exit Function
+    
+    If HasMonthName(s) And HasYearHint(s) Then
+        IsMonthlyPeriodFast = True
+    End If
+
+End Function
+
+
+Private Function HasQuarterToken(ByVal s As String) As Boolean
+    
+    Dim t As String
+    
+    t = " " & Replace$(Replace$(Replace$(Replace$(s, "-", " "), "/", " "), ".", " "), "_", " ") & " "
+    
+    If InStr(1, t, " Q1 ", vbTextCompare) > 0 Then HasQuarterToken = True: Exit Function
+    If InStr(1, t, " Q2 ", vbTextCompare) > 0 Then HasQuarterToken = True: Exit Function
+    If InStr(1, t, " Q3 ", vbTextCompare) > 0 Then HasQuarterToken = True: Exit Function
+    If InStr(1, t, " Q4 ", vbTextCompare) > 0 Then HasQuarterToken = True: Exit Function
+
+End Function
+
+
+Private Function HasMonthName(ByVal s As String) As Boolean
+    
+    Static arr As Variant
+    Dim i As Long
+    
+    If IsEmpty(arr) Then
+        arr = Array( _
+            "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "SEPT", "OCT", "NOV", "DEC", _
+            "JANUARY", "FEBRUARY", "MARCH", "APRIL", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER")
+    End If
+    
+    For i = LBound(arr) To UBound(arr)
+        If InStr(1, s, arr(i), vbTextCompare) > 0 Then
+            HasMonthName = True
+            Exit Function
+        End If
+    Next i
+
+End Function
+
+
+Private Function HasYearHint(ByVal s As String) As Boolean
+    
+    Dim txt As String
+    Dim parts() As String
+    Dim p As Variant
+    
+    txt = UCase$(s)
+    txt = Replace$(txt, "-", " ")
+    txt = Replace$(txt, "/", " ")
+    txt = Replace$(txt, ".", " ")
+    txt = Replace$(txt, ",", " ")
+    txt = Replace$(txt, "_", " ")
+    txt = Replace$(txt, "(", " ")
+    txt = Replace$(txt, ")", " ")
+    
+    parts = Split(txt, " ")
+    
+    For Each p In parts
+        If Len(p) = 4 Then
+            If IsNumeric(p) Then
+                If CLng(p) >= 2000 And CLng(p) <= 2099 Then
+                    HasYearHint = True
+                    Exit Function
+                End If
+            End If
+        ElseIf Len(p) = 2 Then
+            If IsNumeric(p) Then
+                HasYearHint = True
+                Exit Function
+            End If
+        End If
+    Next p
+
+End Function
+
+
+Private Function IsBSPLSheetName(ByVal shName As String) As Boolean
+    
+    Dim s As String
+    s = UCase$(shName)
+    
+    IsBSPLSheetName = (InStr(1, s, "BS", vbTextCompare) > 0 Or InStr(1, s, "PL", vbTextCompare) > 0)
+
+End Function
+
+
+Private Function ColumnLetter(ByVal ws As Worksheet, ByVal colNum As Long) As String
+    
+    Dim s As String
+    s = ws.Cells(1, colNum).Address(False, False)
+    ColumnLetter = Replace$(s, "1", "")
+
+End Function

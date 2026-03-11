@@ -1,0 +1,522 @@
+Option Explicit
+
+Public Sub Roll_BySmartPeriodDetection()
+
+    Dim ws As Worksheet
+    Dim rngRoll As Range
+    Dim blocks As Collection
+    Dim b As Variant
+    Dim msg As String
+    Dim ans As VbMsgBoxResult
+    Dim totalRowsProcessed As Long
+    
+    On Error GoTo ErrHandler
+    
+    Set ws = ActiveSheet
+    
+    MsgBox "Please select the area to roll." & vbCrLf & _
+           "The macro will auto-detect schedule blocks and period columns.", vbInformation
+    
+    On Error Resume Next
+    Set rngRoll = Application.InputBox( _
+                    Prompt:="Select the area to roll", _
+                    Title:="Smart Roll Area", _
+                    Type:=8)
+    On Error GoTo ErrHandler
+    
+    If rngRoll Is Nothing Then Exit Sub
+    If rngRoll.Worksheet.Name <> ws.Name Then
+        MsgBox "Please select the area on the active sheet only.", vbExclamation
+        Exit Sub
+    End If
+    
+    Set blocks = FindSmartRollBlocks(ws, rngRoll)
+    
+    If blocks Is Nothing Or blocks.Count = 0 Then
+        MsgBox "No valid current/previous period pairs were detected.", vbExclamation
+        Exit Sub
+    End If
+    
+    msg = "Detected roll blocks:" & vbCrLf & vbCrLf
+    
+    For Each b In blocks
+        msg = msg & _
+              IIf(Len(b("ScheduleName")) > 0, "[" & b("ScheduleName") & "] ", "") & _
+              "Rows " & b("RowStart") & ":" & b("RowEnd") & _
+              " | Current = " & ColLetter(b("CurrentCol")) & " (" & b("CurrentText") & ")" & _
+              " -> Previous = " & ColLetter(b("PreviousCol")) & " (" & b("PreviousText") & ")" & vbCrLf
+    Next b
+    
+    msg = msg & vbCrLf & _
+          "Rule:" & vbCrLf & _
+          "- Formula linked only to current sheet -> copy formula" & vbCrLf & _
+          "- Formula linked to other sheet/workbook -> copy value" & vbCrLf & _
+          "- Non-formula -> copy value" & vbCrLf & _
+          "- Comments / note / meeting / download / text-only rows -> skip" & vbCrLf & vbCrLf & _
+          "Continue?"
+    
+    ans = MsgBox(msg, vbYesNo + vbQuestion, "Confirm Smart Roll")
+    If ans <> vbYes Then Exit Sub
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    
+    totalRowsProcessed = 0
+    
+    For Each b In blocks
+        totalRowsProcessed = totalRowsProcessed + RollOneSmartBlock(ws, rngRoll, b)
+    Next b
+
+SafeExit:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    
+    MsgBox "Smart roll completed." & vbCrLf & _
+           "Rows updated: " & totalRowsProcessed, vbInformation
+    Exit Sub
+
+ErrHandler:
+    MsgBox "Error: " & Err.Description, vbExclamation
+    Resume SafeExit
+
+End Sub
+
+Private Function FindSmartRollBlocks(ByVal ws As Worksheet, ByVal rngRoll As Range) As Collection
+    
+    Dim results As New Collection
+    Dim headerRows As Collection
+    Dim r As Long, i As Long
+    Dim rowTop As Long, rowBottom As Long
+    Dim rowDates As Collection
+    Dim d1 As Object, d2 As Object, blk As Object
+    Dim nextHeaderRow As Long
+    Dim rowEnd As Long
+    
+    rowTop = Application.Max(1, rngRoll.Row - 6)
+    rowBottom = rngRoll.Row + rngRoll.Rows.Count - 1
+    
+    Set headerRows = New Collection
+    
+    'Find candidate header rows containing at least 2 period/date cells
+    For r = rowTop To rowBottom
+        Set rowDates = GetDateCellsInRow(ws, rngRoll, r)
+        If rowDates.Count >= 2 Then headerRows.Add r
+    Next r
+    
+    If headerRows.Count = 0 Then
+        Set FindSmartRollBlocks = results
+        Exit Function
+    End If
+    
+    For i = 1 To headerRows.Count
+        
+        r = CLng(headerRows(i))
+        Set rowDates = GetDateCellsInRow(ws, rngRoll, r)
+        
+        If rowDates.Count >= 2 Then
+            Dim j As Long
+            For j = 1 To rowDates.Count - 1
+                
+                Set d1 = rowDates(j)
+                Set d2 = rowDates(j + 1)
+                
+                'Two period columns should be close enough to belong to same local schedule
+                If Abs(CLng(d2("Col")) - CLng(d1("Col"))) <= 3 Then
+                    
+                    Set blk = CreateObject("Scripting.Dictionary")
+                    
+                    If CDbl(d1("Dt")) > CDbl(d2("Dt")) Then
+                        blk("CurrentCol") = CLng(d1("Col"))
+                        blk("PreviousCol") = CLng(d2("Col"))
+                        blk("CurrentDt") = CDbl(d1("Dt"))
+                        blk("PreviousDt") = CDbl(d2("Dt"))
+                        blk("CurrentText") = CStr(d1("Text"))
+                        blk("PreviousText") = CStr(d2("Text"))
+                    Else
+                        blk("CurrentCol") = CLng(d2("Col"))
+                        blk("PreviousCol") = CLng(d1("Col"))
+                        blk("CurrentDt") = CDbl(d2("Dt"))
+                        blk("PreviousDt") = CDbl(d1("Dt"))
+                        blk("CurrentText") = CStr(d2("Text"))
+                        blk("PreviousText") = CStr(d1("Text"))
+                    End If
+                    
+                    blk("HeaderRow") = r
+                    blk("ScheduleName") = GetNearestScheduleName(ws, rngRoll, r)
+                    blk("RowStart") = Application.Max(rngRoll.Row, r + 1)
+                    
+                    If i < headerRows.Count Then
+                        nextHeaderRow = CLng(headerRows(i + 1))
+                    Else
+                        nextHeaderRow = rowBottom + 1
+                    End If
+                    
+                    rowEnd = FindDataEndRow(ws, rngRoll, CLng(blk("RowStart")), _
+                                            Application.Min(rowBottom, nextHeaderRow - 1), _
+                                            CLng(blk("CurrentCol")), CLng(blk("PreviousCol")))
+                    
+                    blk("RowEnd") = rowEnd
+                    
+                    If blk("RowStart") <= blk("RowEnd") Then
+                        results.Add blk
+                    End If
+                End If
+            Next j
+        End If
+    Next i
+    
+    Set FindSmartRollBlocks = results
+End Function
+
+Private Function GetDateCellsInRow(ByVal ws As Worksheet, ByVal rngRoll As Range, ByVal r As Long) As Collection
+    
+    Dim results As New Collection
+    Dim c As Long
+    Dim dt As Date
+    Dim displayText As String
+    Dim d As Object
+    
+    For c = rngRoll.Column To rngRoll.Column + rngRoll.Columns.Count - 1
+        If TryParsePeriodCell(ws.Cells(r, c), dt, displayText) Then
+            Set d = CreateObject("Scripting.Dictionary")
+            d("Col") = c
+            d("Dt") = CDbl(DateSerial(Year(dt), Month(dt), 1))
+            d("Text") = displayText
+            results.Add d
+        End If
+    Next c
+    
+    Set GetDateCellsInRow = results
+End Function
+
+Private Function FindDataEndRow(ByVal ws As Worksheet, ByVal rngRoll As Range, _
+                                ByVal rowStart As Long, ByVal rowMax As Long, _
+                                ByVal currentCol As Long, ByVal previousCol As Long) As Long
+    Dim r As Long
+    
+    FindDataEndRow = rowStart - 1
+    
+    For r = rowStart To rowMax
+        If IsHardBreakRow(ws, rngRoll, r) Then Exit For
+        FindDataEndRow = r
+    Next r
+End Function
+
+Private Function IsHardBreakRow(ByVal ws As Worksheet, ByVal rngRoll As Range, ByVal r As Long) As Boolean
+    
+    Dim c As Long
+    Dim nonEmptyCount As Long
+    Dim numericOrFormulaCount As Long
+    Dim txt As String
+    Dim dt As Date
+    Dim dummyText As String
+    
+    nonEmptyCount = 0
+    numericOrFormulaCount = 0
+    
+    For c = rngRoll.Column To rngRoll.Column + rngRoll.Columns.Count - 1
+        
+        txt = Trim$(CStr(ws.Cells(r, c).Text))
+        
+        If Len(txt) > 0 Then nonEmptyCount = nonEmptyCount + 1
+        If ws.Cells(r, c).HasFormula Or IsNumeric(ws.Cells(r, c).Value) Then
+            If Len(txt) > 0 Then numericOrFormulaCount = numericOrFormulaCount + 1
+        End If
+        
+        If TryParsePeriodCell(ws.Cells(r, c), dt, dummyText) Then
+            IsHardBreakRow = True
+            Exit Function
+        End If
+    Next c
+    
+    If nonEmptyCount = 0 Then
+        IsHardBreakRow = True
+        Exit Function
+    End If
+    
+    If numericOrFormulaCount = 0 Then
+        IsHardBreakRow = True
+        Exit Function
+    End If
+    
+    IsHardBreakRow = False
+End Function
+
+Private Function RollOneSmartBlock(ByVal ws As Worksheet, ByVal rngRoll As Range, ByVal blk As Object) As Long
+    
+    Dim r As Long
+    Dim srcCell As Range, dstCell As Range
+    Dim updatedCount As Long
+    
+    updatedCount = 0
+    
+    For r = CLng(blk("RowStart")) To CLng(blk("RowEnd"))
+        
+        If ShouldSkipDataRow(ws, rngRoll, r, CLng(blk("CurrentCol")), CLng(blk("PreviousCol"))) Then
+            GoTo NextRow
+        End If
+        
+        Set srcCell = ws.Cells(r, CLng(blk("CurrentCol")))
+        Set dstCell = ws.Cells(r, CLng(blk("PreviousCol")))
+        
+        If srcCell.MergeCells Or dstCell.MergeCells Then GoTo NextRow
+        
+        If srcCell.HasFormula Then
+    If IsFormulaCurrentSheetOnly(srcCell, ws.Name) Then
+        dstCell.FormulaR1C1 = srcCell.FormulaR1C1
+    Else
+        dstCell.Value = srcCell.Value
+    End If
+Else
+    dstCell.Value = srcCell.Value
+End If
+        
+        updatedCount = updatedCount + 1
+        
+NextRow:
+    Next r
+    
+    RollOneSmartBlock = updatedCount
+End Function
+
+Private Function ShouldSkipDataRow(ByVal ws As Worksheet, ByVal rngRoll As Range, _
+                                   ByVal r As Long, ByVal currentCol As Long, ByVal previousCol As Long) As Boolean
+    
+    Dim labelText As String
+    Dim c As Long
+    Dim anyNumericOrFormula As Boolean
+    Dim allNonEmptyAreText As Boolean
+    Dim txt As String
+    
+    labelText = LCase$(Trim$(GetRowLeadText(ws, rngRoll, r)))
+    
+    If labelText Like "*comment*" _
+       Or labelText Like "*note*" _
+       Or labelText Like "*meeting*" _
+       Or labelText Like "*download*" Then
+        ShouldSkipDataRow = True
+        Exit Function
+    End If
+    
+    If Len(Trim$(CStr(ws.Cells(r, currentCol).Text))) = 0 And _
+       Len(Trim$(CStr(ws.Cells(r, previousCol).Text))) = 0 Then
+        ShouldSkipDataRow = True
+        Exit Function
+    End If
+    
+    anyNumericOrFormula = False
+    allNonEmptyAreText = True
+    
+    For c = rngRoll.Column To rngRoll.Column + rngRoll.Columns.Count - 1
+        txt = Trim$(CStr(ws.Cells(r, c).Text))
+        If Len(txt) > 0 Then
+            If ws.Cells(r, c).HasFormula Or IsNumeric(ws.Cells(r, c).Value) Then
+                anyNumericOrFormula = True
+                allNonEmptyAreText = False
+            End If
+        End If
+    Next c
+    
+    If Not anyNumericOrFormula And allNonEmptyAreText Then
+        ShouldSkipDataRow = True
+        Exit Function
+    End If
+    
+    ShouldSkipDataRow = False
+End Function
+
+Private Function GetNearestScheduleName(ByVal ws As Worksheet, ByVal rngRoll As Range, ByVal headerRow As Long) As String
+    
+    Dim r As Long, c As Long
+    Dim bestText As String
+    Dim txt As String
+    Dim dt As Date
+    Dim dummy As String
+    
+    bestText = ""
+    
+    For r = Application.Max(1, headerRow - 2) To headerRow
+        For c = rngRoll.Column To rngRoll.Column + rngRoll.Columns.Count - 1
+            txt = Trim$(CStr(ws.Cells(r, c).Text))
+            If Len(txt) > 0 Then
+                If Not TryParsePeriodCell(ws.Cells(r, c), dt, dummy) Then
+                    If Len(txt) > Len(bestText) Then bestText = txt
+                End If
+            End If
+        Next c
+    Next r
+    
+    GetNearestScheduleName = bestText
+End Function
+
+Private Function GetRowLeadText(ByVal ws As Worksheet, ByVal rngRoll As Range, ByVal r As Long) As String
+    Dim c As Long
+    For c = rngRoll.Column To rngRoll.Column + rngRoll.Columns.Count - 1
+        If Len(Trim$(CStr(ws.Cells(r, c).Text))) > 0 Then
+            GetRowLeadText = CStr(ws.Cells(r, c).Text)
+            Exit Function
+        End If
+    Next c
+    GetRowLeadText = ""
+End Function
+
+Private Function TryParsePeriodCell(ByVal cel As Range, ByRef dt As Date, ByRef displayText As String) As Boolean
+    
+    Dim s As String
+    Dim rx As Object
+    Dim matches As Object
+    Dim q As Long, fy As Long, yy As Long
+    
+    s = Trim$(Replace(Replace(Replace(CStr(cel.Text), vbLf, " "), ".", "-"), "/", "-"))
+    displayText = s
+    
+    If Len(s) = 0 Then Exit Function
+    
+    On Error GoTo FailParse
+    
+    'Case 1: actual Excel date cell
+    If IsDate(cel.Value) Then
+        If InStr(1, LCase$(cel.NumberFormat), "m", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "jan", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "feb", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "mar", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "apr", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "may", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "jun", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "jul", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "aug", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "sep", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "oct", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "nov", vbTextCompare) > 0 _
+           Or InStr(1, LCase$(s), "dec", vbTextCompare) > 0 Then
+            dt = CDate(cel.Value)
+            TryParsePeriodCell = True
+            Exit Function
+        End If
+    End If
+    
+    'Case 2: Month-year text like Jan-26, Dec 2025, June-25
+    Set rx = CreateObject("VBScript.RegExp")
+    rx.Global = False
+    rx.IgnoreCase = True
+    rx.Pattern = "^(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)[ -]?(\d{2,4})$"
+    
+    If rx.test(s) Then
+        dt = DateValue("1 " & s)
+        TryParsePeriodCell = True
+        Exit Function
+    End If
+    
+    'Case 3: Quarter like Q1 FY26 / Q2FY2026
+    rx.Pattern = "^Q([1-4])[ -]?FY[ -]?(\d{2,4})$"
+    If rx.test(UCase$(s)) Then
+        Set matches = rx.Execute(UCase$(s))
+        q = CLng(matches(0).SubMatches(0))
+        yy = CLng(matches(0).SubMatches(1))
+        fy = NormalizeFYYear(yy)
+        dt = QuarterEndMonthToDate(q, fy)
+        TryParsePeriodCell = True
+        Exit Function
+    End If
+    
+    'Case 4: FY26 / FY2026
+    rx.Pattern = "^FY[ -]?(\d{2,4})$"
+    If rx.test(UCase$(s)) Then
+        Set matches = rx.Execute(UCase$(s))
+        yy = CLng(matches(0).SubMatches(0))
+        fy = NormalizeFYYear(yy)
+        dt = DateSerial(fy, 6, 1)
+        TryParsePeriodCell = True
+        Exit Function
+    End If
+    
+    'Case 5: other valid date text
+    If IsDate(s) Then
+        dt = CDate(s)
+        TryParsePeriodCell = True
+        Exit Function
+    End If
+    
+FailParse:
+    TryParsePeriodCell = False
+End Function
+
+Private Function NormalizeFYYear(ByVal yy As Long) As Long
+    If yy < 100 Then
+        If yy <= 50 Then
+            NormalizeFYYear = 2000 + yy
+        Else
+            NormalizeFYYear = 1900 + yy
+        End If
+    Else
+        NormalizeFYYear = yy
+    End If
+End Function
+
+Private Function QuarterEndMonthToDate(ByVal q As Long, ByVal fy As Long) As Date
+    'Australian FY quarter ends: Q1 Sep, Q2 Dec, Q3 Mar, Q4 Jun
+    Select Case q
+        Case 1: QuarterEndMonthToDate = DateSerial(fy - 1, 9, 1)
+        Case 2: QuarterEndMonthToDate = DateSerial(fy - 1, 12, 1)
+        Case 3: QuarterEndMonthToDate = DateSerial(fy, 3, 1)
+        Case 4: QuarterEndMonthToDate = DateSerial(fy, 6, 1)
+        Case Else: QuarterEndMonthToDate = DateSerial(fy, 6, 1)
+    End Select
+End Function
+
+Private Function IsFormulaCurrentSheetOnly(ByVal c As Range, ByVal currentSheetName As String) As Boolean
+    
+    Dim f As String
+    Dim rx As Object
+    Dim matches As Object
+    Dim m As Object
+    Dim token As String
+    Dim cleaned As String
+    
+    On Error GoTo FailSafe
+    
+    f = c.Formula
+    
+    'Any external workbook link
+    If InStr(1, f, "[", vbTextCompare) > 0 Or InStr(1, f, "]", vbTextCompare) > 0 Then
+        IsFormulaCurrentSheetOnly = False
+        Exit Function
+    End If
+    
+    Set rx = CreateObject("VBScript.RegExp")
+    rx.Global = True
+    rx.IgnoreCase = True
+    rx.Pattern = "((?:'[^']+'|[A-Za-z0-9_\.]+)!)"
+    
+    If rx.test(f) Then
+        Set matches = rx.Execute(f)
+        
+        For Each m In matches
+            token = m.Value
+            cleaned = Left$(token, Len(token) - 1)
+            
+            If Left$(cleaned, 1) = "'" And Right$(cleaned, 1) = "'" Then
+                cleaned = Mid$(cleaned, 2, Len(cleaned) - 2)
+                cleaned = Replace(cleaned, "''", "'")
+            End If
+            
+            If StrComp(cleaned, currentSheetName, vbTextCompare) <> 0 Then
+                IsFormulaCurrentSheetOnly = False
+                Exit Function
+            End If
+        Next m
+    End If
+    
+    IsFormulaCurrentSheetOnly = True
+    Exit Function
+
+FailSafe:
+    IsFormulaCurrentSheetOnly = False
+End Function
+
+Private Function ColLetter(ByVal colNum As Long) As String
+    ColLetter = Split(Cells(1, colNum).Address(False, False), "1")(0)
+
+End Function

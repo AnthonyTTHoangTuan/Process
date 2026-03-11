@@ -1,0 +1,780 @@
+Option Explicit
+
+'========================
+' CONFIG
+'========================
+Private Const LOG_STEP_TIMES As Boolean = False   ' True: Debug.Print per step
+Private Const SHOW_TOTAL_MSGBOX As Boolean = True ' Show total time message
+
+'========================
+' ENTRY
+'========================
+Public Sub RollPack_Run()
+    Dim t0 As Double: t0 = Timer
+
+    Dim oldCalc As XlCalculation
+    Dim oldEvents As Boolean, oldScreen As Boolean
+    Dim oldStatusBar As Variant
+
+    oldScreen = Application.ScreenUpdating
+    oldEvents = Application.EnableEvents
+    oldCalc = Application.Calculation
+    oldStatusBar = Application.StatusBar
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    Application.StatusBar = "RollPack: Running..."
+
+    On Error GoTo CleanFail
+
+    If WorksheetExists("SheetList") Then
+        Process_Instructions_From_SheetList
+    Else
+        RollPack_OneColumn ActiveSheet, "RIGHT", ActiveCell.Column
+    End If
+
+CleanExit:
+    Dim secs As Double: secs = ElapsedSeconds(t0)
+    Application.StatusBar = "RollPack: Done in " & Format$(secs, "0.00") & "s"
+    Debug.Print "RollPack total: " & Format$(secs, "0.00") & " seconds"
+
+    If SHOW_TOTAL_MSGBOX Then
+        MsgBox "RollPack total time: " & Format$(secs, "0.00") & " seconds", vbInformation
+    End If
+
+    Application.CutCopyMode = False
+    Application.Calculation = oldCalc
+    Application.EnableEvents = oldEvents
+    Application.ScreenUpdating = oldScreen
+    Application.StatusBar = oldStatusBar
+    Exit Sub
+
+CleanFail:
+    Resume CleanExit
+End Sub
+
+Private Function ElapsedSeconds(ByVal t0 As Double) As Double
+    Dim t1 As Double: t1 = Timer
+    If t1 < t0 Then t1 = t1 + 86400#
+    ElapsedSeconds = t1 - t0
+End Function
+
+'========================
+' SheetList list (start row 2):
+'   A: sheet name (blank => ActiveSheet)
+'   B: column (to roll OR to ungroup)
+'   C: direction (LEFT/RIGHT)
+'
+' RULES:
+' - If B blank AND C blank => skip row
+' - If B not blank AND C blank => ungroup column B (no roll)
+'========================
+Private Sub Process_Instructions_From_SheetList()
+    Dim wsCfg As Worksheet, lastRow As Long, r As Long
+    Dim sName As String, colRef As String, dir As String
+    Dim wsTarget As Worksheet
+    Dim colIdx As Long
+
+    Set wsCfg = ThisWorkbook.Worksheets("SheetList")
+    lastRow = GetLastUsedRow(wsCfg)
+    If lastRow < 2 Then Exit Sub
+
+    For r = 2 To lastRow
+        sName = Trim$(CStr(wsCfg.Cells(r, "A").Value2))
+        colRef = Trim$(CStr(wsCfg.Cells(r, "B").Value2))
+        dir = UCase$(Trim$(CStr(wsCfg.Cells(r, "C").Value2)))
+
+        If sName = "" And colRef = "" And dir = "" Then GoTo NextRow
+        If UCase$(sName) = "SheetList" Then GoTo NextRow
+
+        If sName = "" Then
+            Set wsTarget = ActiveSheet
+        Else
+            On Error Resume Next
+            Set wsTarget = ThisWorkbook.Worksheets(sName)
+            On Error GoTo 0
+            If wsTarget Is Nothing Then GoTo NextRow
+        End If
+
+        If colRef = "" And dir = "" Then GoTo NextRow
+
+        If colRef <> "" And dir = "" Then
+            colIdx = ColumnToNumber(colRef)
+            UngroupColumnSafe wsTarget, colIdx
+            GoTo NextRow
+        End If
+
+        If dir <> "LEFT" And dir <> "RIGHT" Then GoTo NextRow
+        If colRef = "" Then colRef = CStr(ActiveCell.Column)
+
+        RollPack_OneColumn wsTarget, dir, colRef
+
+NextRow:
+        Set wsTarget = Nothing
+    Next r
+End Sub
+
+Private Sub UngroupColumnSafe(ByVal ws As Worksheet, ByVal colIdx As Long)
+    On Error Resume Next
+    ws.Columns(colIdx).Ungroup
+    On Error GoTo 0
+End Sub
+
+'========================
+' CORE ROLL (FAST)
+'========================
+Private Sub RollPack_OneColumn(ByVal ws As Worksheet, ByVal direction As String, ByVal targetCol As Variant)
+    Dim tStep As Double
+    Dim rollColIdx As Long, lastRow As Long, lastCol As Long
+    Dim oldColIdx As Long, newColIdx As Long
+
+    direction = UCase$(Trim$(direction))
+    rollColIdx = ColumnToNumber(targetCol)
+
+    lastRow = GetLastUsedRow(ws)
+    If lastRow < 1 Then Exit Sub
+    lastCol = GetLastUsedCol(ws)
+    If lastCol < 1 Then Exit Sub
+
+    If direction = "RIGHT" Then
+        tStep = Timer
+        ws.Columns(rollColIdx + 1).Insert Shift:=xlToRight
+        If LOG_STEP_TIMES Then Debug.Print ws.Name & " RIGHT insert: " & Format$(ElapsedSeconds(tStep), "0.00") & "s"
+
+        oldColIdx = rollColIdx
+        newColIdx = rollColIdx + 1
+        lastCol = lastCol + 1
+
+        CopyColumnFormats ws, oldColIdx, newColIdx
+
+        ' NEW RULE: new column keeps ALL formulas (including external)
+        BuildNewColumnFromOld_FAST ws, oldColIdx, newColIdx, lastRow, ws.Name, _
+                                  freezeIfSameRowRightRef:=False, _
+                                  includeExternalFormulasOnNewCol:=True
+
+        ' Old column: external formulas => values
+        FreezeExternalFormulasToValues_FAST ws, oldColIdx, lastRow, ws.Name
+
+        ' Fix RC drift (optional but helps your S-Q vs S-R style issues)
+        FixSameRowOffset_Column ws, oldColIdx, 1, lastRow, 2, 1
+        FixSameRowOffset_Column ws, newColIdx, 1, lastRow, 2, 1
+
+        ' Fix absolute A1 column refs (P->Q, Q->R etc) but DO NOT touch external sheet refs (Sheet!Q)
+        FixRightRoll_ShiftLeftInputs_FAST ws, rollColIdx, newColIdx, lastRow, lastCol
+
+    ElseIf direction = "LEFT" Then
+        tStep = Timer
+        ws.Columns(rollColIdx).Insert Shift:=xlToRight
+        If LOG_STEP_TIMES Then Debug.Print ws.Name & " LEFT insert: " & Format$(ElapsedSeconds(tStep), "0.00") & "s"
+
+        newColIdx = rollColIdx
+        oldColIdx = rollColIdx + 1
+        lastCol = lastCol + 1
+
+        CopyColumnFormats ws, oldColIdx, newColIdx
+
+        BuildNewColumnFromOld_FAST ws, oldColIdx, newColIdx, lastRow, ws.Name, _
+                                  freezeIfSameRowRightRef:=True, _
+                                  includeExternalFormulasOnNewCol:=False
+
+        ' COMMENTS (keep BOLD): copy only existing Notes in that column (fast enough), then clear old
+        CopyNotesWithFormatting_Column ws, oldColIdx, newColIdx
+        ClearCommentsNotes_Fast ws.Range(ws.Cells(1, oldColIdx), ws.Cells(lastRow, oldColIdx))
+
+        ' RC drift
+        FixSameRowOffset_Column ws, oldColIdx, 1, lastRow, -2, -1
+        FixSameRowOffset_Column ws, newColIdx, 1, lastRow, -2, -1
+
+        ' A1 absolute column fixes on the RIGHT side after insert
+        FixRefs_PrevColToInsertedCol_AfterLeftInsert_FAST ws, newColIdx, lastRow, lastCol
+        FixRefs_TwoLeftToOneLeft_InInsertedCol_AfterLeftInsert_FAST ws, newColIdx, lastRow
+    End If
+End Sub
+
+'========================================================
+' FAST: build destination column in ONE write (FormulaR1C1 = array)
+' - includeExternalFormulasOnNewCol = True for RIGHT (your new rule)
+' - LEFT: external refs => keep value
+' - LEFT freeze: same-row refs to RIGHT => keep value
+'========================================================
+Private Sub BuildNewColumnFromOld_FAST(ByVal ws As Worksheet, ByVal oldColIdx As Long, ByVal newColIdx As Long, _
+                                      ByVal lastRow As Long, ByVal thisSheetName As String, _
+                                      ByVal freezeIfSameRowRightRef As Boolean, _
+                                      ByVal includeExternalFormulasOnNewCol As Boolean)
+
+    Dim rngOld As Range, rngNew As Range
+    Dim arrVal As Variant, arrF As Variant, arrOut As Variant
+    Dim i As Long, f As String
+
+    Set rngOld = ws.Range(ws.Cells(1, oldColIdx), ws.Cells(lastRow, oldColIdx))
+    Set rngNew = ws.Range(ws.Cells(1, newColIdx), ws.Cells(lastRow, newColIdx))
+
+    arrVal = rngOld.Value2
+    arrF = rngOld.FormulaR1C1
+    arrOut = arrVal
+
+    For i = 1 To UBound(arrF, 1)
+        If VarType(arrF(i, 1)) = vbString Then
+            f = CStr(arrF(i, 1))
+            If Len(f) > 0 And Left$(f, 1) = "=" Then
+                If includeExternalFormulasOnNewCol Then
+                    ' RIGHT: keep formula always
+                    arrOut(i, 1) = f
+                Else
+                    ' LEFT: external => value; internal => maybe formula
+                    If Not IsExternalFormulaFast_R1C1(f, thisSheetName) Then
+                        If freezeIfSameRowRightRef Then
+                            If Not HasSameRowRightRefR1C1_FAST(f, i, oldColIdx) Then
+                                arrOut(i, 1) = f
+                            End If
+                        Else
+                            arrOut(i, 1) = f
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    rngNew.FormulaR1C1 = arrOut
+End Sub
+
+'========================================================
+' FAST: freeze external formulas to values (array-based)
+'========================================================
+Private Sub FreezeExternalFormulasToValues_FAST(ByVal ws As Worksheet, ByVal colIdx As Long, _
+                                               ByVal lastRow As Long, ByVal thisSheetName As String)
+    Dim rngCol As Range
+    Dim arrVal As Variant, arrF As Variant, arrOut As Variant
+    Dim i As Long, f As String
+
+    Set rngCol = ws.Range(ws.Cells(1, colIdx), ws.Cells(lastRow, colIdx))
+
+    arrVal = rngCol.Value2
+    arrF = rngCol.FormulaR1C1
+    arrOut = arrF
+
+    For i = 1 To UBound(arrF, 1)
+        If VarType(arrF(i, 1)) = vbString Then
+            f = CStr(arrF(i, 1))
+            If Len(f) > 0 And Left$(f, 1) = "=" Then
+                If IsExternalFormulaFast_R1C1(f, thisSheetName) Then
+                    arrOut(i, 1) = arrVal(i, 1)
+                End If
+            End If
+        End If
+    Next i
+
+    rngCol.FormulaR1C1 = arrOut
+End Sub
+
+'========================================================
+' COMMENTS: keep bold for Notes (legacy comments)
+' - iterate only existing comments objects (not rows)
+'========================================================
+Private Sub CopyNotesWithFormatting_Column(ByVal ws As Worksheet, ByVal oldColIdx As Long, ByVal newColIdx As Long)
+    Dim cmt As Comment
+    Dim srcCell As Range, dstCell As Range
+
+    On Error Resume Next
+    For Each cmt In ws.Comments
+        Set srcCell = cmt.Parent
+        If Not srcCell Is Nothing Then
+            If srcCell.Column = oldColIdx Then
+                Set dstCell = srcCell.Offset(0, newColIdx - oldColIdx)
+                CopyLegacyNoteWithFormatting cmt, dstCell
+            End If
+        End If
+    Next cmt
+    On Error GoTo 0
+End Sub
+
+Private Sub CopyLegacyNoteWithFormatting(ByVal srcComment As Comment, ByVal dstCell As Range)
+    ' delete existing note on destination
+    On Error Resume Next
+    If Not dstCell.Comment Is Nothing Then dstCell.Comment.Delete
+    On Error GoTo 0
+
+    Dim srcTF As Object, dstTF As Object
+    Dim txt As String
+    Set srcTF = srcComment.Shape.TextFrame
+    txt = srcTF.Characters.Text
+
+    On Error Resume Next
+    dstCell.AddComment txt
+    On Error GoTo 0
+    If dstCell.Comment Is Nothing Then Exit Sub
+
+    ' copy size (optional)
+    On Error Resume Next
+    dstCell.Comment.Shape.Width = srcComment.Shape.Width
+    dstCell.Comment.Shape.Height = srcComment.Shape.Height
+    On Error GoTo 0
+
+    Set dstTF = dstCell.Comment.Shape.TextFrame
+
+    ' copy base font
+    On Error Resume Next
+    With dstTF.Characters.Font
+        .Name = srcTF.Characters.Font.Name
+        .Size = srcTF.Characters.Font.Size
+        .Color = srcTF.Characters.Font.Color
+    End With
+    On Error GoTo 0
+
+    ' copy rich runs (bold/italic/underline) – per character (comment objects only, not per cell)
+    CopyCommentRichRuns srcTF, dstTF
+End Sub
+
+Private Sub CopyCommentRichRuns(ByVal srcTF As Object, ByVal dstTF As Object)
+    Dim s As String, n As Long
+    s = srcTF.Characters.Text
+    n = Len(s)
+    If n <= 0 Then Exit Sub
+
+    Dim i As Long, runStart As Long, runLen As Long
+    Dim pb As Variant, pit As Variant, pu As Variant
+    Dim b As Variant, it As Variant, u As Variant
+
+    pb = srcTF.Characters(1, 1).Font.Bold
+    pit = srcTF.Characters(1, 1).Font.Italic
+    pu = srcTF.Characters(1, 1).Font.Underline
+    runStart = 1
+
+    For i = 2 To n
+        b = srcTF.Characters(i, 1).Font.Bold
+        it = srcTF.Characters(i, 1).Font.Italic
+        u = srcTF.Characters(i, 1).Font.Underline
+
+        If (b <> pb) Or (it <> pit) Or (u <> pu) Then
+            runLen = i - runStart
+            With dstTF.Characters(runStart, runLen).Font
+                .Bold = pb
+                .Italic = pit
+                .Underline = pu
+            End With
+            runStart = i
+            pb = b: pit = it: pu = u
+        End If
+    Next i
+
+    runLen = n - runStart + 1
+    With dstTF.Characters(runStart, runLen).Font
+        .Bold = pb
+        .Italic = pit
+        .Underline = pu
+    End With
+End Sub
+
+Private Sub ClearCommentsNotes_Fast(ByVal rng As Range)
+    On Error Resume Next
+    rng.ClearNotes
+    rng.ClearComments
+    On Error GoTo 0
+End Sub
+
+'========================================================
+' FAST external detection (no RegExp)
+'========================================================
+Private Function IsExternalFormulaFast_R1C1(ByVal f As String, ByVal thisSheetName As String) As Boolean
+    Dim p As Long, q1 As Long, q0 As Long
+    Dim token As String, nm As String
+    Dim sn As String: sn = LCase$(thisSheetName)
+
+    Dim scanPos As Long: scanPos = 1
+    Do
+        p = InStr(scanPos, f, "!", vbTextCompare)
+        If p = 0 Then Exit Do
+
+        ' workbook prefix [..]..! => external
+        If InStr(1, Left$(f, p), "[", vbTextCompare) > 0 And InStr(1, Left$(f, p), "]", vbTextCompare) > 0 Then
+            IsExternalFormulaFast_R1C1 = True
+            Exit Function
+        End If
+
+        ' quoted sheet: 'Sheet Name'!
+        If p > 1 And Mid$(f, p - 1, 1) = "'" Then
+            q1 = p - 1
+            q0 = InStrRev(f, "'", q1 - 1)
+            If q0 > 0 Then
+                token = Mid$(f, q0 + 1, q1 - q0 - 1)
+                nm = LCase$(Trim$(token))
+                If nm <> sn Then
+                    IsExternalFormulaFast_R1C1 = True
+                    Exit Function
+                End If
+            End If
+        Else
+            ' unquoted: SheetName!
+            Dim k As Long: k = p - 1
+            Do While k > 0
+                Dim ch As String: ch = Mid$(f, k, 1)
+                If (ch Like "[A-Za-z0-9_]") Or ch = "." Or ch = "-" Then
+                    k = k - 1
+                ElseIf ch = "]" Then
+                    IsExternalFormulaFast_R1C1 = True
+                    Exit Function
+                Else
+                    Exit Do
+                End If
+            Loop
+            token = Mid$(f, k + 1, p - (k + 1))
+            nm = LCase$(Trim$(token))
+            If nm <> "" And nm <> sn Then
+                IsExternalFormulaFast_R1C1 = True
+                Exit Function
+            End If
+        End If
+
+        scanPos = p + 1
+    Loop
+
+    IsExternalFormulaFast_R1C1 = False
+End Function
+
+'========================================================
+' FAST same-row-right detection for R1C1
+'========================================================
+Private Function HasSameRowRightRefR1C1_FAST(ByVal fR1C1 As String, ByVal srcRow As Long, ByVal srcCol As Long) As Boolean
+    Dim pos As Long, n As Long, s As String
+
+    pos = 1
+    Do
+        pos = InStr(pos, fR1C1, "C[", vbTextCompare)
+        If pos = 0 Then Exit Do
+        s = Mid$(fR1C1, pos + 2)
+        n = ReadLeadingSignedInt(s)
+        If n > 0 Then
+            HasSameRowRightRefR1C1_FAST = True
+            Exit Function
+        End If
+        pos = pos + 2
+    Loop
+
+    Dim key As String: key = "R" & CStr(srcRow) & "C"
+    pos = InStr(1, fR1C1, key, vbTextCompare)
+    Do While pos > 0
+        s = Mid$(fR1C1, pos + Len(key))
+        n = ReadLeadingInt(s)
+        If n > srcCol Then
+            HasSameRowRightRefR1C1_FAST = True
+            Exit Function
+        End If
+        pos = InStr(pos + Len(key), fR1C1, key, vbTextCompare)
+    Loop
+
+    HasSameRowRightRefR1C1_FAST = False
+End Function
+
+Private Function ReadLeadingSignedInt(ByVal s As String) As Long
+    Dim i As Long, ch As String, sign As Long
+    i = 1: sign = 1
+    If Len(s) = 0 Then Exit Function
+    ch = Mid$(s, 1, 1)
+    If ch = "+" Then sign = 1: i = 2
+    If ch = "-" Then sign = -1: i = 2
+
+    Dim v As Long: v = 0
+    For i = i To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch < "0" Or ch > "9" Then Exit For
+        v = v * 10 + (Asc(ch) - 48)
+    Next i
+    ReadLeadingSignedInt = sign * v
+End Function
+
+Private Function ReadLeadingInt(ByVal s As String) As Long
+    Dim i As Long, ch As String, v As Long
+    v = 0
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch < "0" Or ch > "9" Then Exit For
+        v = v * 10 + (Asc(ch) - 48)
+    Next i
+    ReadLeadingInt = v
+End Function
+
+'========================================================
+' Same-row RC offset fix (ARRAY-BASED)
+'========================================================
+Private Sub FixSameRowOffset_Column(ByVal ws As Worksheet, ByVal colIdx As Long, _
+                                   ByVal startRow As Long, ByVal endRow As Long, _
+                                   ByVal fromOffset As Long, ByVal toOffset As Long)
+
+    Dim rng As Range, arr As Variant
+    Dim i As Long, f As String
+    Dim a As String, b As String, c As String, d As String
+
+    Set rng = ws.Range(ws.Cells(startRow, colIdx), ws.Cells(endRow, colIdx))
+    arr = rng.FormulaR1C1
+
+    a = "RC[" & fromOffset & "]"
+    b = "RC[" & toOffset & "]"
+    c = "R[0]C[" & fromOffset & "]"
+    d = "R[0]C[" & toOffset & "]"
+
+    For i = 1 To UBound(arr, 1)
+        If VarType(arr(i, 1)) = vbString Then
+            f = CStr(arr(i, 1))
+            If Len(f) > 0 And Left$(f, 1) = "=" Then
+                If InStr(1, f, a, vbTextCompare) > 0 Or InStr(1, f, c, vbTextCompare) > 0 Then
+                    f = Replace(f, c, d, , , vbTextCompare)
+                    f = Replace(f, a, b, , , vbTextCompare)
+                    arr(i, 1) = f
+                End If
+            End If
+        End If
+    Next i
+
+    rng.FormulaR1C1 = arr
+End Sub
+
+'========================================================
+' RIGHT roll fix (FAST)
+' - adjusts absolute A1 column refs only for THIS sheet formulas
+' - will not touch "OtherSheet!Q" due to "!" skip in replace
+'========================================================
+Private Sub FixRightRoll_ShiftLeftInputs_FAST(ByVal ws As Worksheet, ByVal rollColIdx As Long, ByVal newColIdx As Long, _
+                                             ByVal lastRow As Long, ByVal lastCol As Long)
+
+    If rollColIdx - 2 < 1 Then Exit Sub
+
+    Dim from1 As String, to1 As String, from2 As String, to2 As String
+    from1 = NumberToColumn(rollColIdx - 1)
+    to1 = NumberToColumn(rollColIdx)
+    from2 = NumberToColumn(rollColIdx - 2)
+    to2 = NumberToColumn(rollColIdx - 1)
+
+    Dim rngNew As Range, arr As Variant, i As Long, f As String
+    Set rngNew = ws.Range(ws.Cells(1, newColIdx), ws.Cells(lastRow, newColIdx))
+    arr = rngNew.Formula
+
+    For i = 1 To UBound(arr, 1)
+        If VarType(arr(i, 1)) = vbString Then
+            f = CStr(arr(i, 1))
+            If Len(f) > 0 And Left$(f, 1) = "=" Then
+                If Not IsExternalFormulaFast_R1C1(rngNew.Cells(i, 1).FormulaR1C1, ws.Name) Then
+                    f = ReplaceColRefs_SkipStrings_FAST(f, from1, to1)
+                    f = ReplaceColRefs_SkipStrings_FAST(f, from2, to2)
+                    arr(i, 1) = f
+                End If
+            End If
+        End If
+    Next i
+    rngNew.Formula = arr
+
+    ' Apply to formulas to the right (only formulas)
+    Dim rngRight As Range, rngF As Range, c As Range
+    If newColIdx > lastCol Then Exit Sub
+    Set rngRight = ws.Range(ws.Cells(1, newColIdx), ws.Cells(lastRow, lastCol))
+
+    On Error Resume Next
+    Set rngF = rngRight.SpecialCells(xlCellTypeFormulas)
+    On Error GoTo 0
+    If rngF Is Nothing Then Exit Sub
+
+    For Each c In rngF.Cells
+        If Not IsExternalFormulaFast_R1C1(c.FormulaR1C1, ws.Name) Then
+            If InStr(1, c.Formula, from1, vbTextCompare) > 0 Or InStr(1, c.Formula, from2, vbTextCompare) > 0 Then
+                c.Formula = ReplaceColRefs_SkipStrings_FAST(c.Formula, from1, to1)
+                c.Formula = ReplaceColRefs_SkipStrings_FAST(c.Formula, from2, to2)
+            End If
+        End If
+    Next c
+End Sub
+
+'========================
+' LEFT fixes (FAST)
+'========================
+Private Sub FixRefs_PrevColToInsertedCol_AfterLeftInsert_FAST(ByVal ws As Worksheet, ByVal insertedColIdx As Long, _
+                                                             ByVal lastRow As Long, ByVal lastCol As Long)
+    Dim prevIdx As Long: prevIdx = insertedColIdx - 1
+    If prevIdx < 1 Then Exit Sub
+
+    Dim prevCol As String, insCol As String
+    prevCol = NumberToColumn(prevIdx)
+    insCol = NumberToColumn(insertedColIdx)
+
+    Dim rightStart As Long: rightStart = insertedColIdx + 1
+    If rightStart > lastCol Then Exit Sub
+
+    Dim rngRight As Range, rngF As Range, c As Range
+    Set rngRight = ws.Range(ws.Cells(1, rightStart), ws.Cells(lastRow, lastCol))
+
+    On Error Resume Next
+    Set rngF = rngRight.SpecialCells(xlCellTypeFormulas)
+    On Error GoTo 0
+    If rngF Is Nothing Then Exit Sub
+
+    For Each c In rngF.Cells
+        If Not IsExternalFormulaFast_R1C1(c.FormulaR1C1, ws.Name) Then
+            If InStr(1, c.Formula, prevCol, vbTextCompare) > 0 Then
+                c.Formula = ReplaceColRefs_SkipStrings_FAST(c.Formula, prevCol, insCol)
+            End If
+        End If
+    Next c
+End Sub
+
+Private Sub FixRefs_TwoLeftToOneLeft_InInsertedCol_AfterLeftInsert_FAST(ByVal ws As Worksheet, ByVal insertedColIdx As Long, _
+                                                                       ByVal lastRow As Long)
+    Dim fromIdx As Long: fromIdx = insertedColIdx - 2
+    Dim toIdx As Long: toIdx = insertedColIdx - 1
+    If fromIdx < 1 Or toIdx < 1 Then Exit Sub
+
+    Dim fromCol As String, toCol As String
+    fromCol = NumberToColumn(fromIdx)
+    toCol = NumberToColumn(toIdx)
+
+    Dim rng As Range, arr As Variant, i As Long, f As String
+    Set rng = ws.Range(ws.Cells(1, insertedColIdx), ws.Cells(lastRow, insertedColIdx))
+    arr = rng.Formula
+
+    For i = 1 To UBound(arr, 1)
+        If VarType(arr(i, 1)) = vbString Then
+            f = CStr(arr(i, 1))
+            If Len(f) > 0 And Left$(f, 1) = "=" Then
+                If Not IsExternalFormulaFast_R1C1(rng.Cells(i, 1).FormulaR1C1, ws.Name) Then
+                    If InStr(1, f, fromCol, vbTextCompare) > 0 Then
+                        arr(i, 1) = ReplaceColRefs_SkipStrings_FAST(f, fromCol, toCol)
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    rng.Formula = arr
+End Sub
+
+'========================================================
+' FAST column ref replacement (no RegExp)
+' - replaces fromCol in A1 refs/ranges
+' - skips strings "..."
+' - avoids changing OtherSheet!Q by skipping if previous char is "!"
+'========================================================
+Private Function ReplaceColRefs_SkipStrings_FAST(ByVal formulaText As String, ByVal fromCol As String, ByVal toCol As String) As String
+    Dim i As Long, j As Long, inQ As Boolean
+    Dim seg As String, out As String
+
+    i = 1
+    Do While i <= Len(formulaText)
+        j = InStr(i, formulaText, """")
+        If j = 0 Then
+            seg = Mid$(formulaText, i)
+            If Not inQ Then seg = ReplaceColRefs_RAW_FAST(seg, fromCol, toCol)
+            out = out & seg
+            Exit Do
+        Else
+            seg = Mid$(formulaText, i, j - i)
+            If Not inQ Then seg = ReplaceColRefs_RAW_FAST(seg, fromCol, toCol)
+            out = out & seg & """"
+            inQ = Not inQ
+            i = j + 1
+        End If
+    Loop
+
+    ReplaceColRefs_SkipStrings_FAST = out
+End Function
+
+Private Function ReplaceColRefs_RAW_FAST(ByVal s As String, ByVal fromCol As String, ByVal toCol As String) As String
+    Dim i As Long, n As Long
+    Dim uFrom As String: uFrom = UCase$(fromCol)
+    Dim uTo As String: uTo = UCase$(toCol)
+
+    n = Len(s)
+    If n = 0 Then ReplaceColRefs_RAW_FAST = s: Exit Function
+
+    Dim out As String: out = ""
+    i = 1
+    Do While i <= n
+        Dim ch As String: ch = Mid$(s, i, 1)
+
+        If (ch = "$" Or (UCase$(ch) >= "A" And UCase$(ch) <= "Z")) Then
+            Dim startI As Long: startI = i
+            Dim hasDollar As Boolean: hasDollar = (ch = "$")
+            Dim k As Long: k = i + IIf(hasDollar, 1, 0)
+
+            If k + Len(uFrom) - 1 <= n Then
+                Dim cand As String: cand = UCase$(Mid$(s, k, Len(uFrom)))
+                If cand = uFrom Then
+                    Dim prev As String: prev = IIf(startI = 1, "", Mid$(s, startI - 1, 1))
+                    If prev <> "!" And Not (prev Like "[A-Za-z0-9_]") Then
+                        Dim nextPos As Long: nextPos = k + Len(uFrom)
+                        Dim nxt As String: nxt = IIf(nextPos <= n, Mid$(s, nextPos, 1), "")
+                        If (nxt Like "[0-9]") Or nxt = ":" Or nxt = "$" Or nxt = "" Then
+                            out = out & IIf(hasDollar, "$", "") & uTo
+                            i = k + Len(uFrom)
+                            GoTo ContinueLoop
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        out = out & ch
+        i = i + 1
+ContinueLoop:
+    Loop
+
+    ReplaceColRefs_RAW_FAST = out
+End Function
+
+'========================
+' Helpers
+'========================
+Private Sub CopyColumnFormats(ByVal ws As Worksheet, ByVal fromCol As Long, ByVal toCol As Long)
+    ws.Columns(fromCol).Copy
+    ws.Columns(toCol).PasteSpecial Paste:=xlPasteFormats
+    ws.Columns(toCol).ColumnWidth = ws.Columns(fromCol).ColumnWidth
+End Sub
+
+Private Function ColumnToNumber(ByVal colRef As Variant) As Long
+    Dim s As String, i As Long, n As Long, ch As Integer
+
+    If IsNumeric(colRef) Then
+        ColumnToNumber = CLng(colRef)
+        Exit Function
+    End If
+
+    s = UCase$(Trim$(Replace(CStr(colRef), "$", "")))
+    n = 0
+
+    For i = 1 To Len(s)
+        ch = Asc(Mid$(s, i, 1))
+        If ch < 65 Or ch > 90 Then Err.Raise vbObjectError + 101, , "Invalid column reference: " & CStr(colRef)
+        n = n * 26 + (ch - 64)
+    Next i
+
+    ColumnToNumber = n
+End Function
+
+Private Function NumberToColumn(ByVal colNum As Long) As String
+    Dim n As Long, r As Long
+    n = colNum
+    NumberToColumn = ""
+    Do While n > 0
+        r = (n - 1) Mod 26
+        NumberToColumn = Chr$(65 + r) & NumberToColumn
+        n = (n - 1) \ 26
+    Loop
+End Function
+
+Private Function WorksheetExists(ByVal sheetName As String) As Boolean
+    On Error Resume Next
+    WorksheetExists = Not ThisWorkbook.Worksheets(sheetName) Is Nothing
+    On Error GoTo 0
+End Function
+
+Private Function GetLastUsedRow(ByVal ws As Worksheet) As Long
+    Dim f As Range
+    Set f = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, _
+                          LookAt:=xlPart, SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False)
+    If f Is Nothing Then GetLastUsedRow = 0 Else GetLastUsedRow = f.Row
+End Function
+
+Private Function GetLastUsedCol(ByVal ws As Worksheet) As Long
+    Dim f As Range
+    Set f = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, _
+                          LookAt:=xlPart, SearchOrder:=xlByColumns, SearchDirection:=xlPrevious, MatchCase:=False)
+    If f Is Nothing Then GetLastUsedCol = 0 Else GetLastUsedCol = f.Column
+End Function

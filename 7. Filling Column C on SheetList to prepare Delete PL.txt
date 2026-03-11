@@ -1,0 +1,71 @@
+Option Explicit
+
+Sub ChangeColBToC_ForPL_AndClearOthers_Fast()
+
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim arrA As Variant, arrB As Variant
+    Dim i As Long, n As Long
+    
+    Set ws = ThisWorkbook.Worksheets("SheetList")
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    If lastRow < 2 Then Exit Sub
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    
+    arrA = ws.Range("A2:A" & lastRow).Value2
+    arrB = ws.Range("B2:B" & lastRow).Value2
+    
+    n = UBound(arrA, 1)
+    
+    For i = 1 To n
+        If HasPLToken(arrA(i, 1)) And Trim$(CStr(arrB(i, 1))) <> "" Then
+            arrB(i, 1) = "C"
+        Else
+            arrB(i, 1) = vbNullString
+        End If
+    Next i
+    
+    ws.Range("B2:B" & lastRow).Value = arrB
+    ws.Range("C2:C" & lastRow).ClearContents
+    
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    
+    MsgBox "Done", vbInformation
+
+End Sub
+
+Private Function HasPLToken(ByVal v As Variant) As Boolean
+    
+    Dim s As String
+    Dim parts() As String
+    Dim p As Variant
+    
+    s = UCase$(Trim$(CStr(v)))
+    If s = vbNullString Then Exit Function
+    
+    s = Replace$(s, "_", " ")
+    s = Replace$(s, "-", " ")
+    s = Replace$(s, "/", " ")
+    s = Replace$(s, "\", " ")
+    s = Replace$(s, "(", " ")
+    s = Replace$(s, ")", " ")
+    
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    
+    parts = Split(s, " ")
+    
+    For Each p In parts
+        If p = "PL" Then
+            HasPLToken = True
+            Exit Function
+        End If
+    Next p
+
+End Function

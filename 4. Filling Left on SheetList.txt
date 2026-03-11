@@ -1,0 +1,26 @@
+Option Explicit
+
+Sub FillLeftInSheetListColC()
+
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim i As Long
+    
+    Set ws = ThisWorkbook.Worksheets("SheetList")
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    
+    Application.ScreenUpdating = False
+    
+    For i = 2 To lastRow
+        If Trim$(CStr(ws.Cells(i, "B").Value)) <> "" Then
+            ws.Cells(i, "C").Value = "Left"
+        Else
+            ws.Cells(i, "C").ClearContents
+        End If
+    Next i
+    
+    Application.ScreenUpdating = True
+    
+    MsgBox "Done", vbInformation
+
+End Sub

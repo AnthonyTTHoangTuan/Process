@@ -1,0 +1,34 @@
+Sub ExportVisibleSheetNames()
+
+    Dim ws As Worksheet
+    Dim out As Worksheet
+    Dim i As Long
+    
+    ' Create or clear SheetList
+    On Error Resume Next
+    Set out = ThisWorkbook.Worksheets("SheetList")
+    On Error GoTo 0
+    
+    If out Is Nothing Then
+        Set out = ThisWorkbook.Worksheets.Add
+        out.Name = "SheetList"
+    Else
+        out.Cells.Clear
+    End If
+    
+    ' Write header
+    out.Range("A1").Value = "Visible Sheet Names"
+    
+    i = 2
+    
+    ' Loop through all sheets
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.Visible = xlSheetVisible Then
+            out.Cells(i, 1).Value = ws.Name
+            i = i + 1
+        End If
+    Next ws
+    
+    MsgBox "Done! Visible sheet names exported to 'SheetList'."
+
+End Sub

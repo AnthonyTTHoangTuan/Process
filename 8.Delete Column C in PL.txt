@@ -1,0 +1,42 @@
+Sub DeleteColumns_From_SheetList()
+
+    Dim wsList As Worksheet
+    Dim wsTarget As Worksheet
+    Dim lastRow As Long
+    Dim i As Long
+    Dim sheetName As String
+    Dim colToDelete As String
+
+    Set wsList = ThisWorkbook.Worksheets("SheetList")
+    lastRow = wsList.Cells(wsList.Rows.Count, "A").End(xlUp).Row
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    For i = 2 To lastRow   ' assume row 1 is header
+        sheetName = Trim(wsList.Cells(i, "A").Value)
+        colToDelete = Trim(wsList.Cells(i, "B").Value)
+
+        If sheetName <> "" And colToDelete <> "" Then
+            On Error Resume Next
+            Set wsTarget = ThisWorkbook.Worksheets(sheetName)
+            On Error GoTo 0
+
+            If Not wsTarget Is Nothing Then
+                On Error Resume Next
+                wsTarget.Columns(colToDelete).Delete
+                On Error GoTo 0
+            End If
+        End If
+
+        Set wsTarget = Nothing
+    Next i
+
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+
+    MsgBox "Column deletion completed.", vbInformation
+
+End Sub

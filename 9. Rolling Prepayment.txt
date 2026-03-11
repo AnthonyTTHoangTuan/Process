@@ -1,0 +1,250 @@
+Option Explicit
+
+Sub Roll_CurrentMonth_From_PreviousMonth_AsPaste_AndUngroupCurrent()
+
+    Dim ws As Worksheet
+    Dim monthRow As Long
+    Dim sumStartRow As Long, sumEndRow As Long
+    Dim formulaStartRow As Long, formulaEndRow As Long
+    
+    Dim firstMonthCol As Long, lastMonthCol As Long
+    Dim currentCol As Long, prevCol As Long
+    Dim c As Long, r As Long
+    
+    Dim currentDate As Date, prevDate As Date
+    
+    Set ws = ActiveSheet
+    
+    '==== SETTINGS ====
+    monthRow = 7
+    sumStartRow = 9
+    sumEndRow = 300
+    formulaStartRow = 9
+    formulaEndRow = 300
+    '==================
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    Application.CutCopyMode = False
+    
+    On Error GoTo SafeExit
+    
+    '1) Find month range
+    FindMonthHeaderRange ws, monthRow, firstMonthCol, lastMonthCol
+    If firstMonthCol = 0 Or lastMonthCol = 0 Then
+        MsgBox "Cannot find month header row.", vbExclamation
+        GoTo SafeExit
+    End If
+    
+    '2) Current month = leftmost month column with SUM(row 9:300)=0
+    currentCol = 0
+    For c = firstMonthCol To lastMonthCol
+        If IsMonthHeader(ws.Cells(monthRow, c).Value) Then
+            If Round(ColumnNumericSum(ws, c, sumStartRow, sumEndRow), 10) = 0 Then
+                currentCol = c
+                Exit For
+            End If
+        End If
+    Next c
+    
+    If currentCol = 0 Then
+        MsgBox "Cannot find current month column with SUM(row " & sumStartRow & ":" & sumEndRow & ") = 0.", vbExclamation
+        GoTo SafeExit
+    End If
+    
+    '3) Previous month = immediate left month column
+    prevCol = PreviousMonthColumn(ws, monthRow, currentCol, firstMonthCol)
+    If prevCol = 0 Then
+        MsgBox "Cannot find previous month column.", vbExclamation
+        GoTo SafeExit
+    End If
+    
+    '4) Validate consecutive months
+    currentDate = HeaderToMonthDate(ws.Cells(monthRow, currentCol).Value)
+    prevDate = HeaderToMonthDate(ws.Cells(monthRow, prevCol).Value)
+    
+    If DateSerial(Year(currentDate), Month(currentDate), 1) <> _
+       DateAdd("m", 1, DateSerial(Year(prevDate), Month(prevDate), 1)) Then
+        MsgBox "Previous month and current month are not consecutive months.", vbExclamation
+        GoTo SafeExit
+    End If
+    
+    '5) Expand / show the related columns first
+    On Error Resume Next
+    ws.Outline.ShowLevels ColumnLevels:=8
+    ExpandGroupAroundColumn ws, prevCol
+    ExpandGroupAroundColumn ws, currentCol
+    On Error GoTo SafeExit
+    
+    '6) Ungroup current month column found
+    UngroupCurrentColumn ws, currentCol
+    
+    '7) Ensure current column visible after ungroup
+    ws.Columns(currentCol).Hidden = False
+    
+    '8) Roll like real copy-paste
+    For r = formulaStartRow To formulaEndRow
+        If ws.Cells(r, prevCol).HasFormula Then
+            ws.Cells(r, prevCol).Copy Destination:=ws.Cells(r, currentCol)
+        End If
+    Next r
+    
+    Application.CutCopyMode = False
+    
+    MsgBox "Rolled formulas by copy-paste from " & ws.Cells(monthRow, prevCol).Text & _
+           " to " & ws.Cells(monthRow, currentCol).Text & _
+           " and ungrouped current month column.", vbInformation
+
+SafeExit:
+    Application.CutCopyMode = False
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+
+End Sub
+
+Private Sub UngroupCurrentColumn(ByVal ws As Worksheet, ByVal targetCol As Long)
+    On Error Resume Next
+    ws.Columns(targetCol).Hidden = False
+    ws.Columns(targetCol).Ungroup
+    On Error GoTo 0
+End Sub
+
+Private Sub ExpandGroupAroundColumn(ByVal ws As Worksheet, ByVal targetCol As Long)
+    Dim lvl As Long
+    Dim l As Long, r As Long
+    
+    On Error Resume Next
+    
+    ws.Columns(targetCol).Hidden = False
+    ws.Columns(targetCol).ShowDetail = True
+    
+    lvl = ws.Columns(targetCol).OutlineLevel
+    If lvl <= 1 Then Exit Sub
+    
+    l = targetCol
+    Do While l > 1 And ws.Columns(l - 1).OutlineLevel >= lvl
+        l = l - 1
+    Loop
+    
+    r = targetCol
+    Do While r < ws.Columns.Count And ws.Columns(r + 1).OutlineLevel >= lvl
+        r = r + 1
+    Loop
+    
+    ws.Range(ws.Columns(l), ws.Columns(r)).EntireColumn.Hidden = False
+End Sub
+
+Private Sub FindMonthHeaderRange(ByVal ws As Worksheet, ByVal monthRow As Long, _
+                                 ByRef firstMonthCol As Long, ByRef lastMonthCol As Long)
+    Dim c As Long
+    Dim lastUsedCol As Long
+    
+    firstMonthCol = 0
+    lastMonthCol = 0
+    lastUsedCol = ws.Cells(monthRow, ws.Columns.Count).End(xlToLeft).Column
+    
+    For c = 1 To lastUsedCol
+        If IsMonthHeader(ws.Cells(monthRow, c).Value) Then
+            If firstMonthCol = 0 Then firstMonthCol = c
+            lastMonthCol = c
+        End If
+    Next c
+End Sub
+
+Private Function PreviousMonthColumn(ByVal ws As Worksheet, ByVal monthRow As Long, _
+                                     ByVal currentCol As Long, ByVal firstMonthCol As Long) As Long
+    Dim c As Long
+    For c = currentCol - 1 To firstMonthCol Step -1
+        If IsMonthHeader(ws.Cells(monthRow, c).Value) Then
+            PreviousMonthColumn = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+Private Function IsMonthHeader(ByVal v As Variant) As Boolean
+    On Error GoTo Fail
+    Dim d As Date
+    d = HeaderToMonthDate(v)
+    IsMonthHeader = True
+    Exit Function
+Fail:
+    IsMonthHeader = False
+End Function
+
+Private Function HeaderToMonthDate(ByVal v As Variant) As Date
+    Dim s As String
+    Dim parts() As String
+    Dim m As Long, y As Long
+    
+    If IsDate(v) Then
+        HeaderToMonthDate = DateSerial(Year(CDate(v)), Month(CDate(v)), 1)
+        Exit Function
+    End If
+    
+    s = Trim$(CStr(v))
+    s = Replace(s, "/", "-")
+    s = Replace(s, ".", "-")
+    s = WorksheetFunction.Trim(s)
+    
+    parts = Split(s, "-")
+    If UBound(parts) <> 1 Then Err.Raise 5
+    
+    m = MonthFromText(parts(0))
+    y = TwoOrFourDigitYear(parts(1))
+    
+    HeaderToMonthDate = DateSerial(y, m, 1)
+End Function
+
+Private Function MonthFromText(ByVal monText As String) As Long
+    Select Case UCase$(Left$(Trim$(monText), 3))
+        Case "JAN": MonthFromText = 1
+        Case "FEB": MonthFromText = 2
+        Case "MAR": MonthFromText = 3
+        Case "APR": MonthFromText = 4
+        Case "MAY": MonthFromText = 5
+        Case "JUN": MonthFromText = 6
+        Case "JUL": MonthFromText = 7
+        Case "AUG": MonthFromText = 8
+        Case "SEP": MonthFromText = 9
+        Case "OCT": MonthFromText = 10
+        Case "NOV": MonthFromText = 11
+        Case "DEC": MonthFromText = 12
+        Case Else: Err.Raise 5
+    End Select
+End Function
+
+Private Function TwoOrFourDigitYear(ByVal yText As String) As Long
+    Dim y As Long
+    y = Val(Trim$(yText))
+    
+    If y < 100 Then
+        If y <= 29 Then
+            TwoOrFourDigitYear = 2000 + y
+        Else
+            TwoOrFourDigitYear = 1900 + y
+        End If
+    Else
+        TwoOrFourDigitYear = y
+    End If
+End Function
+
+Private Function ColumnNumericSum(ByVal ws As Worksheet, ByVal colNum As Long, _
+                                  ByVal firstRow As Long, ByVal lastRow As Long) As Double
+    Dim arr As Variant
+    Dim i As Long
+    
+    arr = ws.Range(ws.Cells(firstRow, colNum), ws.Cells(lastRow, colNum)).Value2
+    
+    If IsArray(arr) Then
+        For i = 1 To UBound(arr, 1)
+            If IsNumeric(arr(i, 1)) Then
+                ColumnNumericSum = ColumnNumericSum + CDbl(arr(i, 1))
+            End If
+        Next i
+    Else
+        If IsNumeric(arr) Then ColumnNumericSum = CDbl(arr)
+    End If
+End Function
