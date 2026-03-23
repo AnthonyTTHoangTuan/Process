@@ -190,24 +190,38 @@ Private Sub RollOneSheetOneColumn( _
         addrOriginal = effectiveSrcColLetters & CStr(i)
 
         If isFormula Then
-            If levelMap.Exists(addrOriginal) Then
-                lvl = CLng(levelMap(addrOriginal))
-            Else
-                lvl = LVL_INTERNAL
-            End If
 
-            If lvl = LVL_HARDCODED And freezeMaxLevel >= LVL_HARDCODED Then
-                ws.Cells(i, tgtCol).Formula = CStr(arrFormula(i, 1))
-                Debug.Print "Level 3 hard-coded formula preserved without rolling: [" & ws.Name & "!" & addrOriginal & "] -> [" & ws.Name & "!" & ColumnNumberToLetters(tgtCol) & CStr(i) & "]"
-            ElseIf ShouldFreezeLevel(lvl, freezeMaxLevel) Then
-                ws.Cells(i, workSrcCol).Value = arrValue(i, 1)
-                ws.Cells(i, tgtCol).Formula = BuildFrozenTargetFormula(CStr(arrFormula(i, 1)), ws.Name, colDelta)
-            Else
-                ws.Cells(i, tgtCol).FormulaR1C1 = CStr(arrFormulaR1C1(i, 1))
-            End If
+    If levelMap.Exists(addrOriginal) Then
+        lvl = CLng(levelMap(addrOriginal))
+    Else
+        lvl = LVL_INTERNAL
+    End If
+
+    If lvl = LVL_HARDCODED And freezeMaxLevel >= LVL_HARDCODED Then
+        ws.Cells(i, tgtCol).Formula = CStr(arrFormula(i, 1))
+    ElseIf lvl <= freezeMaxLevel Then
+        ws.Cells(i, tgtCol).Formula = CStr(arrFormula(i, 1))
+    Else
+        ws.Cells(i, tgtCol).Formula = RollFormulaLevelAware( _
+            CStr(arrFormula(i, 1)), forward, lvl, freezeMaxLevel)
+    End If
+
+Else
+    ' 🔥 NEW LOGIC: treat numeric constants as level 3
+    If IsNumeric(arrValue(i, 1)) And Not IsEmpty(arrValue(i, 1)) Then
+        
+        If freezeMaxLevel >= LVL_HARDCODED Then
+            ' preserve (do not roll)
+            ws.Cells(i, tgtCol).Value = arrValue(i, 1)
         Else
+            ' optional: allow change (normally still same)
             ws.Cells(i, tgtCol).Value = arrValue(i, 1)
         End If
+        
+    Else
+        ws.Cells(i, tgtCol).Value = arrValue(i, 1)
+    End If
+End If
     Next i
 End Sub
 
