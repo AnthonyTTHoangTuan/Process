@@ -1824,7 +1824,7 @@ Private Function FormulaHasHardCodedNumbers(ByVal formulaText As String) As Bool
     Do While i <= n
         ch = Mid$(formulaText, i, 1)
 
-        If ch = """ Then
+        If ch = """" Then
             i = SkipDoubleQuotedString(formulaText, i)
             GoTo ContinueLoop
         End If
