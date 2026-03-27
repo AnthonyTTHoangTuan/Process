@@ -1,0 +1,330 @@
+Option Explicit
+
+Public Sub Roll_Prior_From_Current_Fast()
+
+    Const LIST_SHEET As String = "SheetList"
+    
+    Dim wsList As Worksheet
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim i As Long
+    
+    Dim sheetName As String
+    Dim sourceSpec As String
+    Dim targetSpec As String
+    
+    Dim sourceRng As Range
+    Dim targetRng As Range
+    
+    Dim oldCalc As XlCalculation
+    Dim startTime As Double
+    Dim elapsedSeconds As Double
+    
+    On Error GoTo FailSafe
+    
+    startTime = Timer
+    
+    Set wsList = ThisWorkbook.Worksheets(LIST_SHEET)
+    lastRow = wsList.Cells(wsList.Rows.Count, "A").End(xlUp).Row
+    
+    oldCalc = Application.Calculation
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    Application.CutCopyMode = False
+    Application.StatusBar = "Rolling..."
+    
+    For i = 2 To lastRow
+        
+        Set ws = Nothing
+        Set sourceRng = Nothing
+        Set targetRng = Nothing
+        
+        On Error GoTo RowError
+        
+        sheetName = Trim$(CStr(wsList.Cells(i, "A").Value))
+        sourceSpec = Trim$(CStr(wsList.Cells(i, "B").Value))
+        targetSpec = Trim$(CStr(wsList.Cells(i, "C").Value))
+        
+        If sheetName = "" Then GoTo NextRow
+        
+        On Error Resume Next
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+        On Error GoTo RowError
+        
+        If ws Is Nothing Then GoTo NextRow
+        If sourceSpec = "" Or targetSpec = "" Then GoTo NextRow
+        
+        ws.DisplayPageBreaks = False
+        
+        Set sourceRng = ResolveRangeSpec(ws, sourceSpec)
+        Set targetRng = ResolveRangeSpec(ws, targetSpec)
+        
+        If sourceRng Is Nothing Or targetRng Is Nothing Then GoTo NextRow
+        
+        Set sourceRng = ReduceWholeColumnToUsedRows(sourceRng, ws)
+        Set targetRng = ReduceWholeColumnToUsedRows(targetRng, ws)
+        
+        If sourceRng.Rows.Count <> targetRng.Rows.Count Or _
+           sourceRng.Columns.Count <> targetRng.Columns.Count Then
+            GoTo NextRow
+        End If
+        
+        Application.StatusBar = "Rolling " & ws.Name & " (" & i - 1 & "/" & lastRow - 1 & ")..."
+        RollOneRangeFast sourceRng, targetRng, ws.Name
+        
+NextRow:
+        On Error GoTo 0
+    Next i
+
+CleanExit:
+    Application.CutCopyMode = False
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.Calculation = oldCalc
+    
+    elapsedSeconds = Timer - startTime
+    If elapsedSeconds < 0 Then elapsedSeconds = elapsedSeconds + 86400#
+    
+    MsgBox "Roll completed in " & Format(elapsedSeconds, "0.00") & " seconds.", vbInformation
+    Exit Sub
+
+RowError:
+    Resume NextRow
+
+FailSafe:
+    Application.CutCopyMode = False
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.Calculation = oldCalc
+    MsgBox "Macro stopped: " & Err.Description, vbExclamation
+
+End Sub
+
+Private Sub RollOneRangeFast(ByVal sourceRng As Range, ByVal targetRng As Range, ByVal currentSheetName As String)
+
+    Dim sourceFormulaCells As Range
+    Dim targetFormulaCells As Range
+    Dim c As Range
+    Dim tgtCell As Range
+    
+    Dim cache As Object
+    Dim keepTarget As Object
+    Dim keepFormula As Object
+    
+    Dim relKey As String
+    Dim fKey As String
+    Dim isInternal As Boolean
+    Dim k As Variant
+    Dim parts() As String
+    
+    Set cache = CreateObject("Scripting.Dictionary")
+    Set keepTarget = CreateObject("Scripting.Dictionary")
+    Set keepFormula = CreateObject("Scripting.Dictionary")
+    
+    ' Step 0: capture existing internal formulas in target FIRST
+    On Error Resume Next
+    Set targetFormulaCells = targetRng.SpecialCells(xlCellTypeFormulas)
+    On Error GoTo 0
+    
+    If Not targetFormulaCells Is Nothing Then
+        For Each c In targetFormulaCells.Cells
+            
+            fKey = c.Formula
+            
+            If cache.Exists("TGT|" & fKey & "|" & currentSheetName) Then
+                isInternal = cache("TGT|" & fKey & "|" & currentSheetName)
+            Else
+                isInternal = IsInternalFormulaFast(fKey, currentSheetName, cache)
+                cache("TGT|" & fKey & "|" & currentSheetName) = isInternal
+            End If
+            
+            If isInternal Then
+                relKey = CStr(c.Row - targetRng.Row + 1) & "|" & CStr(c.Column - targetRng.Column + 1)
+                keepTarget(relKey) = True
+                keepFormula(relKey) = c.FormulaR1C1
+            End If
+            
+        Next c
+    End If
+    
+    ' Step 1: copy everything from source as values first
+    targetRng.Value2 = sourceRng.Value2
+    
+    ' Step 2: process source formulas, but skip cells where target internal formula must be preserved
+    On Error Resume Next
+    Set sourceFormulaCells = sourceRng.SpecialCells(xlCellTypeFormulas)
+    On Error GoTo 0
+    
+    If Not sourceFormulaCells Is Nothing Then
+        For Each c In sourceFormulaCells.Cells
+            
+            relKey = CStr(c.Row - sourceRng.Row + 1) & "|" & CStr(c.Column - sourceRng.Column + 1)
+            
+            If keepTarget.Exists(relKey) Then
+                GoTo NextFormulaCell
+            End If
+            
+            Set tgtCell = targetRng.Cells(c.Row - sourceRng.Row + 1, c.Column - sourceRng.Column + 1)
+            
+            fKey = c.Formula
+            
+            If cache.Exists("SRC|" & fKey & "|" & currentSheetName) Then
+                isInternal = cache("SRC|" & fKey & "|" & currentSheetName)
+            Else
+                isInternal = IsInternalFormulaFast(fKey, currentSheetName, cache)
+                cache("SRC|" & fKey & "|" & currentSheetName) = isInternal
+            End If
+            
+            If isInternal Then
+                tgtCell.FormulaR1C1 = c.FormulaR1C1
+            Else
+                tgtCell.Value2 = c.Value2
+            End If
+            
+NextFormulaCell:
+        Next c
+    End If
+    
+    ' Step 3: restore preserved target internal formulas
+    For Each k In keepFormula.Keys
+        parts = Split(CStr(k), "|")
+        targetRng.Cells(CLng(parts(0)), CLng(parts(1))).FormulaR1C1 = keepFormula(k)
+    Next k
+
+End Sub
+
+Private Function ResolveRangeSpec(ByVal ws As Worksheet, ByVal spec As String) As Range
+
+    Dim s As String
+    
+    s = Trim$(Replace(spec, "$", ""))
+    
+    If s = "" Then Exit Function
+    
+    On Error GoTo InvalidSpec
+    
+    If IsColumnLettersOnly(s) Then
+        Set ResolveRangeSpec = ws.Columns(s)
+    Else
+        Set ResolveRangeSpec = ws.Range(s)
+    End If
+    
+    Exit Function
+
+InvalidSpec:
+    Set ResolveRangeSpec = Nothing
+
+End Function
+
+Private Function ReduceWholeColumnToUsedRows(ByVal rng As Range, ByVal ws As Worksheet) As Range
+
+    Dim firstRow As Long
+    Dim lastRow As Long
+    Dim firstCol As Long
+    Dim lastCol As Long
+    
+    If rng Is Nothing Then Exit Function
+    
+    If rng.Rows.Count = ws.Rows.Count Then
+        If WorksheetFunction.CountA(ws.Cells) = 0 Then
+            firstRow = 1
+            lastRow = 1
+        Else
+            firstRow = ws.UsedRange.Row
+            lastRow = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+        End If
+        
+        firstCol = rng.Column
+        lastCol = rng.Column + rng.Columns.Count - 1
+        
+        Set ReduceWholeColumnToUsedRows = ws.Range(ws.Cells(firstRow, firstCol), ws.Cells(lastRow, lastCol))
+    Else
+        Set ReduceWholeColumnToUsedRows = rng
+    End If
+
+End Function
+
+Private Function IsColumnLettersOnly(ByVal s As String) As Boolean
+
+    Dim i As Long
+    Dim ch As String
+    
+    s = Trim$(s)
+    If s = "" Then Exit Function
+    
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If Not ((ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z")) Then
+            IsColumnLettersOnly = False
+            Exit Function
+        End If
+    Next i
+    
+    IsColumnLettersOnly = True
+
+End Function
+
+Private Function IsInternalFormulaFast(ByVal formulaText As String, ByVal currentSheetName As String, ByVal cache As Object) As Boolean
+
+    Static re As Object
+    
+    Dim matches As Object
+    Dim m As Object
+    Dim qualifier As String
+    Dim cleaned As String
+    Dim cacheKey As String
+    
+    cacheKey = "CHK|" & formulaText & "|" & currentSheetName
+    
+    If cache.Exists(cacheKey) Then
+        IsInternalFormulaFast = cache(cacheKey)
+        Exit Function
+    End If
+    
+    If re Is Nothing Then
+        Set re = CreateObject("VBScript.RegExp")
+        With re
+            .Global = True
+            .IgnoreCase = False
+            .Pattern = "((?:'[^']*(?:''[^']*)*'|\[[^\]]+\][^!]+|[A-Za-z0-9_\.]+))!"
+        End With
+    End If
+    
+    If Not re.Test(formulaText) Then
+        IsInternalFormulaFast = True
+        cache(cacheKey) = True
+        Exit Function
+    End If
+    
+    Set matches = re.Execute(formulaText)
+    IsInternalFormulaFast = True
+    
+    For Each m In matches
+        qualifier = m.SubMatches(0)
+        
+        If InStr(qualifier, "[") > 0 Then
+            IsInternalFormulaFast = False
+            cache(cacheKey) = False
+            Exit Function
+        End If
+        
+        cleaned = qualifier
+        
+        If Left$(cleaned, 1) = "'" And Right$(cleaned, 1) = "'" Then
+            cleaned = Mid$(cleaned, 2, Len(cleaned) - 2)
+            cleaned = Replace(cleaned, "''", "'")
+        End If
+        
+        If StrComp(cleaned, currentSheetName, vbTextCompare) <> 0 Then
+            IsInternalFormulaFast = False
+            cache(cacheKey) = False
+            Exit Function
+        End If
+    Next m
+    
+    cache(cacheKey) = True
+
+End Function
