@@ -105,36 +105,69 @@ End Sub
 
 Private Sub RollOneRangeFast(ByVal sourceRng As Range, ByVal targetRng As Range, ByVal currentSheetName As String)
 
-    Dim formulaCells As Range
+    Dim sourceFormulaCells As Range
+    Dim targetFormulaCells As Range
     Dim c As Range
     Dim tgtCell As Range
     
     Dim cache As Object
+    Dim keepTarget As Object
+    Dim keepFormula As Object
+    
+    Dim relKey As String
     Dim fKey As String
     Dim isInternal As Boolean
-    
-    ' Step 1: copy everything as values first
-    targetRng.Value2 = sourceRng.Value2
-    
-    ' Step 2: only inspect formula cells in source
-    On Error Resume Next
-    Set formulaCells = sourceRng.SpecialCells(xlCellTypeFormulas)
-    On Error GoTo 0
+    Dim k As Variant
+    Dim parts() As String
     
     Set cache = CreateObject("Scripting.Dictionary")
+    Set keepTarget = CreateObject("Scripting.Dictionary")
+    Set keepFormula = CreateObject("Scripting.Dictionary")
     
-    If Not formulaCells Is Nothing Then
-        For Each c In formulaCells.Cells
+    ' Step 0: capture existing internal formulas in target FIRST
+    On Error Resume Next
+    Set targetFormulaCells = targetRng.SpecialCells(xlCellTypeFormulas)
+    On Error GoTo 0
+    
+    If Not targetFormulaCells Is Nothing Then
+        For Each c In targetFormulaCells.Cells
+            
+            fKey = c.Formula
+            
+            If cache.Exists("TGT|" & fKey & "|" & currentSheetName) Then
+                isInternal = cache("TGT|" & fKey & "|" & currentSheetName)
+            Else
+                isInternal = IsInternalFormulaFast(fKey, currentSheetName, cache)
+                cache("TGT|" & fKey & "|" & currentSheetName) = isInternal
+            End If
+            
+            If isInternal Then
+                relKey = CStr(c.Row - targetRng.Row + 1) & "|" & CStr(c.Column - targetRng.Column + 1)
+                keepTarget(relKey) = True
+                keepFormula(relKey) = c.FormulaR1C1
+            End If
+            
+        Next c
+    End If
+    
+    ' Step 1: copy everything from source as values first
+    targetRng.Value2 = sourceRng.Value2
+    
+    ' Step 2: process source formulas, but skip cells where target internal formula must be preserved
+    On Error Resume Next
+    Set sourceFormulaCells = sourceRng.SpecialCells(xlCellTypeFormulas)
+    On Error GoTo 0
+    
+    If Not sourceFormulaCells Is Nothing Then
+        For Each c In sourceFormulaCells.Cells
+            
+            relKey = CStr(c.Row - sourceRng.Row + 1) & "|" & CStr(c.Column - sourceRng.Column + 1)
+            
+            If keepTarget.Exists(relKey) Then
+                GoTo NextFormulaCell
+            End If
             
             Set tgtCell = targetRng.Cells(c.Row - sourceRng.Row + 1, c.Column - sourceRng.Column + 1)
-            
-            ' Priority 1:
-            ' if target already has an internal formula, keep it
-            If tgtCell.HasFormula Then
-                If IsInternalFormulaFast(tgtCell.Formula, currentSheetName, cache) Then
-                    GoTo NextFormulaCell
-                End If
-            End If
             
             fKey = c.Formula
             
@@ -154,6 +187,12 @@ Private Sub RollOneRangeFast(ByVal sourceRng As Range, ByVal targetRng As Range,
 NextFormulaCell:
         Next c
     End If
+    
+    ' Step 3: restore preserved target internal formulas
+    For Each k In keepFormula.Keys
+        parts = Split(CStr(k), "|")
+        targetRng.Cells(CLng(parts(0)), CLng(parts(1))).FormulaR1C1 = keepFormula(k)
+    Next k
 
 End Sub
 
