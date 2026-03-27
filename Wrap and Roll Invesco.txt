@@ -1,6 +1,6 @@
 Option Explicit
 
-Public Sub Roll_Prior_From_Current()
+Public Sub Roll_Prior_From_Current_Fast()
 
     Const LIST_SHEET As String = "SheetList"
     
@@ -32,6 +32,7 @@ Public Sub Roll_Prior_From_Current()
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
     Application.CutCopyMode = False
+    Application.StatusBar = "Rolling..."
     
     For i = 2 To lastRow
         
@@ -54,6 +55,8 @@ Public Sub Roll_Prior_From_Current()
         If ws Is Nothing Then GoTo NextRow
         If sourceSpec = "" Or targetSpec = "" Then GoTo NextRow
         
+        ws.DisplayPageBreaks = False
+        
         Set sourceRng = ResolveRangeSpec(ws, sourceSpec)
         Set targetRng = ResolveRangeSpec(ws, targetSpec)
         
@@ -67,7 +70,8 @@ Public Sub Roll_Prior_From_Current()
             GoTo NextRow
         End If
         
-        RollOneRange sourceRng, targetRng, ws.Name
+        Application.StatusBar = "Rolling " & ws.Name & " (" & i - 1 & "/" & lastRow - 1 & ")..."
+        RollOneRangeFast sourceRng, targetRng, ws.Name
         
 NextRow:
         On Error GoTo 0
@@ -75,6 +79,7 @@ NextRow:
 
 CleanExit:
     Application.CutCopyMode = False
+    Application.StatusBar = False
     Application.ScreenUpdating = True
     Application.EnableEvents = True
     Application.Calculation = oldCalc
@@ -90,6 +95,7 @@ RowError:
 
 FailSafe:
     Application.CutCopyMode = False
+    Application.StatusBar = False
     Application.ScreenUpdating = True
     Application.EnableEvents = True
     Application.Calculation = oldCalc
@@ -97,31 +103,57 @@ FailSafe:
 
 End Sub
 
-Private Sub RollOneRange(ByVal sourceRng As Range, ByVal targetRng As Range, ByVal currentSheetName As String)
+Private Sub RollOneRangeFast(ByVal sourceRng As Range, ByVal targetRng As Range, ByVal currentSheetName As String)
 
-    Dim r As Long
-    Dim c As Long
-    Dim srcCell As Range
+    Dim formulaCells As Range
+    Dim c As Range
     Dim tgtCell As Range
     
-    For r = 1 To sourceRng.Rows.Count
-        For c = 1 To sourceRng.Columns.Count
+    Dim cache As Object
+    Dim fKey As String
+    Dim isInternal As Boolean
+    
+    ' Step 1: copy everything as values first
+    targetRng.Value2 = sourceRng.Value2
+    
+    ' Step 2: only inspect formula cells in source
+    On Error Resume Next
+    Set formulaCells = sourceRng.SpecialCells(xlCellTypeFormulas)
+    On Error GoTo 0
+    
+    Set cache = CreateObject("Scripting.Dictionary")
+    
+    If Not formulaCells Is Nothing Then
+        For Each c In formulaCells.Cells
             
-            Set srcCell = sourceRng.Cells(r, c)
-            Set tgtCell = targetRng.Cells(r, c)
+            Set tgtCell = targetRng.Cells(c.Row - sourceRng.Row + 1, c.Column - sourceRng.Column + 1)
             
-            If srcCell.HasFormula Then
-                If IsInternalFormula(srcCell.Formula, currentSheetName) Then
-                    tgtCell.FormulaR1C1 = srcCell.FormulaR1C1
-                Else
-                    tgtCell.Value2 = srcCell.Value2
+            ' Priority 1:
+            ' if target already has an internal formula, keep it
+            If tgtCell.HasFormula Then
+                If IsInternalFormulaFast(tgtCell.Formula, currentSheetName, cache) Then
+                    GoTo NextFormulaCell
                 End If
-            Else
-                tgtCell.Value2 = srcCell.Value2
             End If
             
+            fKey = c.Formula
+            
+            If cache.Exists("SRC|" & fKey & "|" & currentSheetName) Then
+                isInternal = cache("SRC|" & fKey & "|" & currentSheetName)
+            Else
+                isInternal = IsInternalFormulaFast(fKey, currentSheetName, cache)
+                cache("SRC|" & fKey & "|" & currentSheetName) = isInternal
+            End If
+            
+            If isInternal Then
+                tgtCell.FormulaR1C1 = c.FormulaR1C1
+            Else
+                tgtCell.Value2 = c.Value2
+            End If
+            
+NextFormulaCell:
         Next c
-    Next r
+    End If
 
 End Sub
 
@@ -196,35 +228,47 @@ Private Function IsColumnLettersOnly(ByVal s As String) As Boolean
 
 End Function
 
-Private Function IsInternalFormula(ByVal formulaText As String, ByVal currentSheetName As String) As Boolean
+Private Function IsInternalFormulaFast(ByVal formulaText As String, ByVal currentSheetName As String, ByVal cache As Object) As Boolean
 
-    Dim re As Object
+    Static re As Object
+    
     Dim matches As Object
     Dim m As Object
     Dim qualifier As String
     Dim cleaned As String
+    Dim cacheKey As String
     
-    Set re = CreateObject("VBScript.RegExp")
+    cacheKey = "CHK|" & formulaText & "|" & currentSheetName
     
-    With re
-        .Global = True
-        .IgnoreCase = False
-        .Pattern = "((?:'[^']*(?:''[^']*)*'|\[[^\]]+\][^!]+|[A-Za-z0-9_\.]+))!"
-    End With
+    If cache.Exists(cacheKey) Then
+        IsInternalFormulaFast = cache(cacheKey)
+        Exit Function
+    End If
+    
+    If re Is Nothing Then
+        Set re = CreateObject("VBScript.RegExp")
+        With re
+            .Global = True
+            .IgnoreCase = False
+            .Pattern = "((?:'[^']*(?:''[^']*)*'|\[[^\]]+\][^!]+|[A-Za-z0-9_\.]+))!"
+        End With
+    End If
     
     If Not re.Test(formulaText) Then
-        IsInternalFormula = True
+        IsInternalFormulaFast = True
+        cache(cacheKey) = True
         Exit Function
     End If
     
     Set matches = re.Execute(formulaText)
-    IsInternalFormula = True
+    IsInternalFormulaFast = True
     
     For Each m In matches
         qualifier = m.SubMatches(0)
         
         If InStr(qualifier, "[") > 0 Then
-            IsInternalFormula = False
+            IsInternalFormulaFast = False
+            cache(cacheKey) = False
             Exit Function
         End If
         
@@ -236,9 +280,12 @@ Private Function IsInternalFormula(ByVal formulaText As String, ByVal currentShe
         End If
         
         If StrComp(cleaned, currentSheetName, vbTextCompare) <> 0 Then
-            IsInternalFormula = False
+            IsInternalFormulaFast = False
+            cache(cacheKey) = False
             Exit Function
         End If
     Next m
+    
+    cache(cacheKey) = True
 
 End Function
