@@ -1,221 +1,244 @@
 Option Explicit
 
-Public Sub Roll_From_Prior_To_Current()
+Public Sub Roll_Prior_From_Current()
+
+    Const LIST_SHEET As String = "SheetList"
+    
     Dim wsList As Worksheet
-    Dim lastRow As Long, i As Long
-    Dim sheetName As String
-    Dim currRef As String, priorRef As String
     Dim ws As Worksheet
-    Dim srcRng As Range, tgtRng As Range
-    Dim srcCell As Range, tgtCell As Range
-    Dim nRows As Long, nCols As Long
-    Dim r As Long, c As Long
+    Dim lastRow As Long
+    Dim i As Long
     
-    On Error GoTo ErrHandler
+    Dim sheetName As String
+    Dim sourceSpec As String
+    Dim targetSpec As String
     
-    Set wsList = ThisWorkbook.Worksheets("SheetList")
+    Dim sourceRng As Range
+    Dim targetRng As Range
+    
+    Dim oldCalc As XlCalculation
+    Dim startTime As Double
+    Dim elapsedSeconds As Double
+    
+    On Error GoTo FailSafe
+    
+    startTime = Timer
+    
+    Set wsList = ThisWorkbook.Worksheets(LIST_SHEET)
     lastRow = wsList.Cells(wsList.Rows.Count, "A").End(xlUp).Row
     
+    oldCalc = Application.Calculation
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
+    Application.CutCopyMode = False
     
     For i = 2 To lastRow
-        sheetName = Trim(wsList.Cells(i, "A").Value)
-        currRef = Trim(wsList.Cells(i, "B").Value)
-        priorRef = Trim(wsList.Cells(i, "C").Value)
         
-        If sheetName <> "" Then
-            On Error Resume Next
-            Set ws = ThisWorkbook.Worksheets(sheetName)
-            On Error GoTo ErrHandler
-            
-            If ws Is Nothing Then
-                Debug.Print "Sheet not found: " & sheetName
-                GoTo NextRow
-            End If
-            
-            ' Build ranges
-            Set tgtRng = ResolveRange(ws, currRef)
-            Set srcRng = ResolveRange(ws, priorRef)
-            
-            If tgtRng Is Nothing Or srcRng Is Nothing Then
-                Debug.Print "Invalid range at SheetList row " & i & " | Sheet: " & sheetName
-                GoTo NextRow
-            End If
-            
-            ' Size must match
-            If tgtRng.Rows.Count <> srcRng.Rows.Count Or tgtRng.Columns.Count <> srcRng.Columns.Count Then
-                Debug.Print "Range size mismatch at row " & i & " | Sheet: " & sheetName & _
-                            " | Current: " & tgtRng.Address(0, 0) & _
-                            " | Prior: " & srcRng.Address(0, 0)
-                GoTo NextRow
-            End If
-            
-            nRows = srcRng.Rows.Count
-            nCols = srcRng.Columns.Count
-            
-            For r = 1 To nRows
-                For c = 1 To nCols
-                    Set srcCell = srcRng.Cells(r, c)
-                    Set tgtCell = tgtRng.Cells(r, c)
-                    
-                    RollOneCell srcCell, tgtCell, ws.Name
-                Next c
-            Next r
+        Set ws = Nothing
+        Set sourceRng = Nothing
+        Set targetRng = Nothing
+        
+        On Error GoTo RowError
+        
+        sheetName = Trim$(CStr(wsList.Cells(i, "A").Value))
+        sourceSpec = Trim$(CStr(wsList.Cells(i, "B").Value))
+        targetSpec = Trim$(CStr(wsList.Cells(i, "C").Value))
+        
+        If sheetName = "" Then GoTo NextRow
+        
+        On Error Resume Next
+        Set ws = ThisWorkbook.Worksheets(sheetName)
+        On Error GoTo RowError
+        
+        If ws Is Nothing Then GoTo NextRow
+        If sourceSpec = "" Or targetSpec = "" Then GoTo NextRow
+        
+        Set sourceRng = ResolveRangeSpec(ws, sourceSpec)
+        Set targetRng = ResolveRangeSpec(ws, targetSpec)
+        
+        If sourceRng Is Nothing Or targetRng Is Nothing Then GoTo NextRow
+        
+        Set sourceRng = ReduceWholeColumnToUsedRows(sourceRng, ws)
+        Set targetRng = ReduceWholeColumnToUsedRows(targetRng, ws)
+        
+        If sourceRng.Rows.Count <> targetRng.Rows.Count Or _
+           sourceRng.Columns.Count <> targetRng.Columns.Count Then
+            GoTo NextRow
         End If
         
+        RollOneRange sourceRng, targetRng, ws.Name
+        
 NextRow:
-        Set ws = Nothing
-        Set srcRng = Nothing
-        Set tgtRng = Nothing
+        On Error GoTo 0
     Next i
 
 CleanExit:
+    Application.CutCopyMode = False
     Application.ScreenUpdating = True
     Application.EnableEvents = True
-    Application.Calculation = xlCalculationAutomatic
+    Application.Calculation = oldCalc
+    
+    elapsedSeconds = Timer - startTime
+    If elapsedSeconds < 0 Then elapsedSeconds = elapsedSeconds + 86400#
+    
+    MsgBox "Roll completed in " & Format(elapsedSeconds, "0.00") & " seconds.", vbInformation
     Exit Sub
 
-ErrHandler:
-    MsgBox "Error: " & Err.Description, vbExclamation
-    Resume CleanExit
-End Sub
+RowError:
+    Resume NextRow
 
-Private Sub RollOneCell(ByVal srcCell As Range, ByVal tgtCell As Range, ByVal currentSheetName As String)
-    On Error GoTo SafeExit
-    
-    If srcCell.HasFormula Then
-        If IsInternalFormula(srcCell, currentSheetName) Then
-            ' Internal formula: copy as Excel would do, preserving relative refs
-            srcCell.Copy
-            tgtCell.PasteSpecial xlPasteFormulas
-            tgtCell.PasteSpecial xlPasteFormats
-        Else
-            ' External formula: paste value only
-            tgtCell.Value = srcCell.Value
-            srcCell.Copy
-            tgtCell.PasteSpecial xlPasteFormats
-        End If
-    Else
-        ' Non-formula: copy value + formats
-        tgtCell.Value = srcCell.Value
-        srcCell.Copy
-        tgtCell.PasteSpecial xlPasteFormats
-    End If
-    
-SafeExit:
+FailSafe:
     Application.CutCopyMode = False
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.Calculation = oldCalc
+    MsgBox "Macro stopped: " & Err.Description, vbExclamation
+
 End Sub
 
-Private Function IsInternalFormula(ByVal c As Range, ByVal currentSheetName As String) As Boolean
-    Dim f As String
-    Dim re As Object
-    Dim matches As Object
-    Dim m As Object
-    Dim token As String
-    
-    If Not c.HasFormula Then
-        IsInternalFormula = False
-        Exit Function
-    End If
-    
-    f = c.Formula
-    
-    ' If workbook reference exists, treat as external
-    If InStr(1, f, "[", vbTextCompare) > 0 Then
-        IsInternalFormula = False
-        Exit Function
-    End If
-    
-    ' Find all explicit sheet references like Sheet1!A1 or 'My Sheet'!A1
-    Set re = CreateObject("VBScript.RegExp")
-    re.Global = True
-    re.IgnoreCase = True
-    re.Pattern = "('([^']|'')+'|[A-Za-z0-9_\.]+)!"
-    
-    Set matches = re.Execute(f)
-    
-    If matches.Count = 0 Then
-        ' No sheet name in formula = same-sheet formula
-        IsInternalFormula = True
-        Exit Function
-    End If
-    
-    For Each m In matches
-        token = m.Value
-        token = Left$(token, Len(token) - 1) ' remove !
-        
-        If Left$(token, 1) = "'" And Right$(token, 1) = "'" Then
-            token = Mid$(token, 2, Len(token) - 2)
-            token = Replace(token, "''", "'")
-        End If
-        
-        If StrComp(token, currentSheetName, vbTextCompare) <> 0 Then
-            IsInternalFormula = False
-            Exit Function
-        End If
-    Next m
-    
-    IsInternalFormula = True
-End Function
+Private Sub RollOneRange(ByVal sourceRng As Range, ByVal targetRng As Range, ByVal currentSheetName As String)
 
-Private Function ResolveRange(ByVal ws As Worksheet, ByVal refText As String) As Range
+    Dim r As Long
+    Dim c As Long
+    Dim srcCell As Range
+    Dim tgtCell As Range
+    
+    For r = 1 To sourceRng.Rows.Count
+        For c = 1 To sourceRng.Columns.Count
+            
+            Set srcCell = sourceRng.Cells(r, c)
+            Set tgtCell = targetRng.Cells(r, c)
+            
+            If srcCell.HasFormula Then
+                If IsInternalFormula(srcCell.Formula, currentSheetName) Then
+                    tgtCell.FormulaR1C1 = srcCell.FormulaR1C1
+                Else
+                    tgtCell.Value2 = srcCell.Value2
+                End If
+            Else
+                tgtCell.Value2 = srcCell.Value2
+            End If
+            
+        Next c
+    Next r
+
+End Sub
+
+Private Function ResolveRangeSpec(ByVal ws As Worksheet, ByVal spec As String) As Range
+
     Dim s As String
     
-    s = Trim(refText)
+    s = Trim$(Replace(spec, "$", ""))
     
-    If s = "" Then
-        Set ResolveRange = Nothing
-        Exit Function
-    End If
+    If s = "" Then Exit Function
     
-    On Error GoTo Fail
+    On Error GoTo InvalidSpec
     
-    ' Case 1: only column letter(s), e.g. H or AA
     If IsColumnLettersOnly(s) Then
-        Set ResolveRange = ws.Columns(s)
-        Exit Function
+        Set ResolveRangeSpec = ws.Columns(s)
+    Else
+        Set ResolveRangeSpec = ws.Range(s)
     End If
     
-    ' Case 2: full column ref, e.g. H:H or AA:AA
-    If IsFullColumnReference(s) Then
-        Set ResolveRange = ws.Range(s)
-        Exit Function
-    End If
-    
-    ' Case 3: normal range, e.g. H5:H100
-    Set ResolveRange = ws.Range(s)
     Exit Function
+
+InvalidSpec:
+    Set ResolveRangeSpec = Nothing
+
+End Function
+
+Private Function ReduceWholeColumnToUsedRows(ByVal rng As Range, ByVal ws As Worksheet) As Range
+
+    Dim firstRow As Long
+    Dim lastRow As Long
+    Dim firstCol As Long
+    Dim lastCol As Long
     
-Fail:
-    Set ResolveRange = Nothing
+    If rng Is Nothing Then Exit Function
+    
+    If rng.Rows.Count = ws.Rows.Count Then
+        If WorksheetFunction.CountA(ws.Cells) = 0 Then
+            firstRow = 1
+            lastRow = 1
+        Else
+            firstRow = ws.UsedRange.Row
+            lastRow = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+        End If
+        
+        firstCol = rng.Column
+        lastCol = rng.Column + rng.Columns.Count - 1
+        
+        Set ReduceWholeColumnToUsedRows = ws.Range(ws.Cells(firstRow, firstCol), ws.Cells(lastRow, lastCol))
+    Else
+        Set ReduceWholeColumnToUsedRows = rng
+    End If
+
 End Function
 
 Private Function IsColumnLettersOnly(ByVal s As String) As Boolean
-    Dim i As Long, ch As String
+
+    Dim i As Long
+    Dim ch As String
     
-    s = UCase$(Trim$(s))
+    s = Trim$(s)
     If s = "" Then Exit Function
     
     For i = 1 To Len(s)
         ch = Mid$(s, i, 1)
-        If ch < "A" Or ch > "Z" Then Exit Function
+        If Not ((ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z")) Then
+            IsColumnLettersOnly = False
+            Exit Function
+        End If
     Next i
     
     IsColumnLettersOnly = True
+
 End Function
 
-Private Function IsFullColumnReference(ByVal s As String) As Boolean
-    Dim arr() As String
+Private Function IsInternalFormula(ByVal formulaText As String, ByVal currentSheetName As String) As Boolean
+
+    Dim re As Object
+    Dim matches As Object
+    Dim m As Object
+    Dim qualifier As String
+    Dim cleaned As String
     
-    s = UCase$(Trim$(s))
-    If InStr(1, s, ":", vbTextCompare) = 0 Then Exit Function
+    Set re = CreateObject("VBScript.RegExp")
     
-    arr = Split(s, ":")
-    If UBound(arr) <> 1 Then Exit Function
+    With re
+        .Global = True
+        .IgnoreCase = False
+        .Pattern = "((?:'[^']*(?:''[^']*)*'|\[[^\]]+\][^!]+|[A-Za-z0-9_\.]+))!"
+    End With
     
-    If IsColumnLettersOnly(arr(0)) And IsColumnLettersOnly(arr(1)) Then
-        IsFullColumnReference = True
+    If Not re.Test(formulaText) Then
+        IsInternalFormula = True
+        Exit Function
     End If
+    
+    Set matches = re.Execute(formulaText)
+    IsInternalFormula = True
+    
+    For Each m In matches
+        qualifier = m.SubMatches(0)
+        
+        If InStr(qualifier, "[") > 0 Then
+            IsInternalFormula = False
+            Exit Function
+        End If
+        
+        cleaned = qualifier
+        
+        If Left$(cleaned, 1) = "'" And Right$(cleaned, 1) = "'" Then
+            cleaned = Mid$(cleaned, 2, Len(cleaned) - 2)
+            cleaned = Replace(cleaned, "''", "'")
+        End If
+        
+        If StrComp(cleaned, currentSheetName, vbTextCompare) <> 0 Then
+            IsInternalFormula = False
+            Exit Function
+        End If
+    Next m
+
 End Function
